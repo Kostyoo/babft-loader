@@ -1,5 +1,5 @@
 --[[
-loader.lua — свой загрузчик построек Build a Boat for Treasure (для Solara). Версия 0.9: окно, предпросмотр, стройка, журнал.
+loader.lua — свой загрузчик построек Build a Boat for Treasure (для Solara). Версия 0.15: окно, предпросмотр, стройка, журнал, картинки, копия постройки.
   * папка с постройками (можно сменить; быстрые кнопки — папки, найденные в workspace);
   * список файлов .Build (формат Butter: {"Data": {...}, "AutoBuild_Version": "v1"});
   * карточка постройки: сколько блоков, видов, связей, размер;
@@ -28,9 +28,17 @@ BABFT_Loader/logs/.
 0.9: новый вид окна: тень, градиент акцента, плавное открытие/закрытие/сворачивание, RightShift — спрятать;
 режимы и качество — сегменты с бегающей подложкой, превью — тумблер, сдвиг — крестовина (в центре — шаг);
 полоски этапов с бликом и точками состояния, счётчики «докручиваются», списки появляются по очереди.
+0.10: постройки на миллион связей: недостающие связи считаются без списка пар и с передышками, ожидание опоздавших
+опрашивает реже, если подсчёт долгий.
+0.11: режимы чипа (Or/And/Xor) взаимоисключающие — включается только нужный, лишний гасится по одному за круг.
+0.12: связи от сиденья с клавишей (третье число в Binds) — отдельными запросами с кодом клавиши, как в игре.
+0.13: дисплей-блоки тоже получают размер из файла (уменьшенные пиксели).
+0.14: «Копия» — постройка с участка (своего или чужого игрока) сохраняется в файл .Build с именем.
+0.15: слева вкладки «Файлы / Картинка / Копия»; «Картинка» строит PNG/BMP из выбранного блока (разрешение,
+пиксель, размер, толщина, стеной/на пол, меньше цветов, склейка одинаковых); подсказки при наведении.
 ]]
 
-local VERSION = "0.9"
+local VERSION = "0.15"
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
@@ -236,6 +244,8 @@ local SCALABLE = {}
 for _, n in ipairs({ "PlasticBlock", "MetalBlock", "WoodBlock", "GlassBlock", "NeonBlock", "ConcreteBlock", "GoldBlock",
 	"IceBlock", "StoneBlock", "MarbleBlock", "TitaniumBlock", "ObsidianBlock", "FabricBlock", "BrickBlock", "GrassBlock",
 	"SandBlock", "CoalBlock", "RustedBlock", "SmoothWoodBlock", "BouncyBlock", "ToyBlock", "CandyBlock" }) do SCALABLE[n] = true end
+-- размер меняют и у дисплей-блока (17.10, со слов пользователя), но блоков он берёт как один — в расход не считаем
+local RESIZABLE = setmetatable({ DisplayBlock = true }, { __index = SCALABLE })
 
 local function listBuilds(folder)
 	local out = {}
@@ -325,6 +335,543 @@ local function have(name)
 	local v = lp:FindFirstChild("Data") and lp.Data:FindFirstChild(name)
 	return v and v.Value or 0
 end
+
+-- >>> img_core (17.10) — картинка -> постройка; только Luau (buffer, bit32), без Roblox API: проверяется luau.exe
+-- Img.decode(bytes) -> { w, h, px = buffer RGBA (w*h*4) } | nil, ошибка      (PNG — все виды, BMP 8/24/32 бит)
+-- Img.resample(img, W, H, yield) -> buffer RGBA W×H (среднее по клетке, прозрачность учитывается)
+-- Img.quantize(px, W, H, n) -> buffer RGBA, число цветов (медианное сечение; прозрачные не трогает)
+-- Img.rects(px, W, H, merge, maxW, maxH) -> { {x, y, w, h, hex} } (одинаковые соседи — одним прямоугольником)
+-- Img.place(rects, W, H, opt) -> список деталей для загрузчика (opt: kind, px, t, floor, y0)
+local Img = {}
+do                                                          -- свои переменные — внутри (у Luau предел 200 локальных на функцию)
+
+local function u32be(b, o)
+	return buffer.readu8(b, o) * 16777216 + buffer.readu8(b, o + 1) * 65536 + buffer.readu8(b, o + 2) * 256 + buffer.readu8(b, o + 3)
+end
+
+-- ---------- inflate (RFC 1951), по мотивам puff ----------
+local LBASE = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 }
+local LEXT = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 }
+local DBASE = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097,
+	6145, 8193, 12289, 16385, 24577 }
+local DEXT = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 }
+local ORDER = { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 }
+
+local function huff(lengths, n)                  -- lengths[1..n] -> {count[1..16] (длина+1), symbol[...]}
+	local count = table.create(16, 0)
+	for i = 1, n do count[lengths[i] + 1] += 1 end
+	count[1] = 0
+	local offs = table.create(16, 0)
+	for len = 1, 14 do offs[len + 2] = offs[len + 1] + count[len + 1] end
+	local symbol = table.create(n, 0)
+	for i = 1, n do
+		local L = lengths[i]
+		if L ~= 0 then symbol[offs[L + 1] + 1] = i - 1; offs[L + 1] += 1 end
+	end
+	return count, symbol
+end
+
+local function inflate(src, pos, outSize, yield)
+	local out = buffer.create(outSize)
+	local op = 0
+	local srcLen = buffer.len(src)
+	local bitbuf, bitcnt = 0, 0
+	local function bits(n)
+		while bitcnt < n do
+			if pos >= srcLen then error("данные оборваны") end
+			bitbuf += bit32.lshift(buffer.readu8(src, pos), bitcnt)
+			pos += 1; bitcnt += 8
+		end
+		local v = bit32.band(bitbuf, bit32.lshift(1, n) - 1)
+		bitbuf = bit32.rshift(bitbuf, n); bitcnt -= n
+		return v
+	end
+	local function decode(count, symbol)
+		local code, first, index = 0, 0, 0
+		for len = 1, 15 do
+			if bitcnt == 0 then
+				if pos >= srcLen then error("данные оборваны") end
+				bitbuf = buffer.readu8(src, pos); pos += 1; bitcnt = 8
+			end
+			code += bit32.band(bitbuf, 1)
+			bitbuf = bit32.rshift(bitbuf, 1); bitcnt -= 1
+			local c = count[len + 1]
+			if code - c < first then return symbol[index + code - first + 1] end
+			index += c; first += c
+			first *= 2; code *= 2
+		end
+		error("плохой код Хаффмана")
+	end
+	local steps = 0
+	local function codes(lc, ls, dc, ds)
+		while true do
+			local sym = decode(lc, ls)
+			if sym < 256 then
+				if op >= outSize then error("данных больше, чем пикселей") end
+				buffer.writeu8(out, op, sym); op += 1
+			elseif sym == 256 then
+				return
+			else
+				sym -= 257
+				if sym >= 29 then error("плохая длина") end
+				local len = LBASE[sym + 1] + bits(LEXT[sym + 1])
+				local dsym = decode(dc, ds)
+				if dsym >= 30 then error("плохое расстояние") end
+				local dist = DBASE[dsym + 1] + bits(DEXT[dsym + 1])
+				if dist > op then error("расстояние дальше начала") end
+				if op + len > outSize then error("данных больше, чем пикселей") end
+				local from = op - dist
+				if dist >= len then
+					buffer.copy(out, op, out, from, len)
+				else
+					for k = 0, len - 1 do buffer.writeu8(out, op + k, buffer.readu8(out, from + k)) end
+				end
+				op += len
+			end
+			steps += 1
+			if yield and steps % 200000 == 0 then yield() end
+		end
+	end
+	local fixedL, fixedD
+	repeat
+		local last = bits(1)
+		local typ = bits(2)
+		if typ == 0 then
+			bitbuf, bitcnt = 0, 0
+			if pos + 4 > srcLen then error("данные оборваны") end
+			local len = buffer.readu8(src, pos) + buffer.readu8(src, pos + 1) * 256
+			pos += 4
+			if pos + len > srcLen or op + len > outSize then error("плохой несжатый блок") end
+			buffer.copy(out, op, src, pos, len)
+			pos += len; op += len
+		elseif typ == 1 then
+			if not fixedL then
+				local l = table.create(288, 0)
+				for i = 1, 144 do l[i] = 8 end
+				for i = 145, 256 do l[i] = 9 end
+				for i = 257, 280 do l[i] = 7 end
+				for i = 281, 288 do l[i] = 8 end
+				local lc, ls = huff(l, 288)
+				local d = table.create(30, 5)
+				local dc, ds = huff(d, 30)
+				fixedL, fixedD = { lc, ls }, { dc, ds }
+			end
+			codes(fixedL[1], fixedL[2], fixedD[1], fixedD[2])
+		elseif typ == 2 then
+			local nlen, ndist, ncode = bits(5) + 257, bits(5) + 1, bits(4) + 4
+			local lengths = table.create(19, 0)
+			for i = 1, ncode do lengths[ORDER[i] + 1] = bits(3) end
+			local cc, cs = huff(lengths, 19)
+			local all = table.create(nlen + ndist, 0)
+			local i = 1
+			while i <= nlen + ndist do
+				local sym = decode(cc, cs)
+				if sym < 16 then
+					all[i] = sym; i += 1
+				else
+					local rep, val = 0, 0
+					if sym == 16 then
+						if i == 1 then error("повтор без предыдущей длины") end
+						val = all[i - 1]; rep = 3 + bits(2)
+					elseif sym == 17 then rep = 3 + bits(3)
+					else rep = 11 + bits(7) end
+					if i + rep - 1 > nlen + ndist then error("слишком много длин") end
+					for _ = 1, rep do all[i] = val; i += 1 end
+				end
+			end
+			local ll, dl = table.create(nlen, 0), table.create(ndist, 0)
+			for k = 1, nlen do ll[k] = all[k] end
+			for k = 1, ndist do dl[k] = all[nlen + k] end
+			local lc, ls = huff(ll, nlen)
+			local dc, ds = huff(dl, ndist)
+			codes(lc, ls, dc, ds)
+		else
+			error("плохой тип блока")
+		end
+	until last == 1
+	return out, op
+end
+
+-- ---------- PNG ----------
+local function decodePNG(b, yield)
+	local n = buffer.len(b)
+	local p = 8
+	local w, h, depth, ctype, interlace
+	local plte, trns
+	local idat, idatLen = {}, 0
+	while p + 8 <= n do
+		local len = u32be(b, p)
+		local typ = buffer.readstring(b, p + 4, 4)
+		local d = p + 8
+		if d + len > n then return nil, "файл оборван" end
+		if typ == "IHDR" then
+			w, h = u32be(b, d), u32be(b, d + 4)
+			depth, ctype = buffer.readu8(b, d + 8), buffer.readu8(b, d + 9)
+			interlace = buffer.readu8(b, d + 12)
+		elseif typ == "PLTE" then
+			plte = buffer.create(len); buffer.copy(plte, 0, b, d, len)
+		elseif typ == "tRNS" then
+			trns = buffer.create(len); buffer.copy(trns, 0, b, d, len)
+		elseif typ == "IDAT" then
+			table.insert(idat, buffer.readstring(b, d, len)); idatLen += len
+		elseif typ == "IEND" then
+			break
+		end
+		p = d + len + 4
+	end
+	if not w then return nil, "нет заголовка PNG" end
+	if w == 0 or h == 0 or w * h > 16000000 then return nil, ("странный размер %d×%d"):format(w, h) end
+	local ch = ({ [0] = 1, [2] = 3, [3] = 1, [4] = 2, [6] = 4 })[ctype]
+	if not ch then return nil, "неизвестный тип цвета PNG" end
+	if ctype == 3 and not plte then return nil, "нет палитры" end
+	local bitsPP = ch * depth
+	local bpp = math.max(1, bitsPP // 8)
+	-- проходы: без чересстрочности — один на всю картинку; Adam7 — семь
+	local passes
+	if interlace == 1 then
+		passes = { { 0, 0, 8, 8 }, { 4, 0, 8, 8 }, { 0, 4, 4, 8 }, { 2, 0, 4, 4 }, { 0, 2, 2, 4 }, { 1, 0, 2, 2 }, { 0, 1, 1, 2 } }
+	else
+		passes = { { 0, 0, 1, 1 } }
+	end
+	local total = 0
+	local dims = {}
+	for i, ps in ipairs(passes) do
+		local pw = (w - ps[1] + ps[3] - 1) // ps[3]
+		local ph = (h - ps[2] + ps[4] - 1) // ps[4]
+		if w <= ps[1] then pw = 0 end
+		if h <= ps[2] then ph = 0 end
+		local rowBytes = (pw * bitsPP + 7) // 8
+		dims[i] = { pw, ph, rowBytes, total }
+		if pw > 0 and ph > 0 then total += ph * (rowBytes + 1) end
+	end
+	local z = buffer.fromstring(table.concat(idat))
+	if buffer.len(z) < 2 or bit32.band(buffer.readu8(z, 0), 15) ~= 8 or bit32.band(buffer.readu8(z, 1), 32) ~= 0 then
+		return nil, "не zlib-сжатие"
+	end
+	local ok, raw = pcall(inflate, z, 2, total, yield)
+	if not ok then return nil, "PNG: " .. tostring(raw):gsub("^.-:%d+: ", "") end
+	-- фильтры строк (на месте)
+	for i = 1, #passes do
+		local pw, ph, rowBytes, base = dims[i][1], dims[i][2], dims[i][3], dims[i][4]
+		if pw > 0 and ph > 0 then
+			for y = 0, ph - 1 do
+				local row = base + y * (rowBytes + 1)
+				local f = buffer.readu8(raw, row)
+				local cur, prev = row + 1, row - rowBytes            -- prev = начало данных предыдущей строки
+				if f == 1 then
+					for x = bpp, rowBytes - 1 do
+						buffer.writeu8(raw, cur + x, (buffer.readu8(raw, cur + x) + buffer.readu8(raw, cur + x - bpp)) % 256)
+					end
+				elseif f == 2 and y > 0 then
+					for x = 0, rowBytes - 1 do
+						buffer.writeu8(raw, cur + x, (buffer.readu8(raw, cur + x) + buffer.readu8(raw, prev + x)) % 256)
+					end
+				elseif f == 3 then
+					for x = 0, rowBytes - 1 do
+						local a = x >= bpp and buffer.readu8(raw, cur + x - bpp) or 0
+						local up = y > 0 and buffer.readu8(raw, prev + x) or 0
+						buffer.writeu8(raw, cur + x, (buffer.readu8(raw, cur + x) + (a + up) // 2) % 256)
+					end
+				elseif f == 4 then
+					for x = 0, rowBytes - 1 do
+						local a = x >= bpp and buffer.readu8(raw, cur + x - bpp) or 0
+						local up = y > 0 and buffer.readu8(raw, prev + x) or 0
+						local c = (x >= bpp and y > 0) and buffer.readu8(raw, prev + x - bpp) or 0
+						local pp = a + up - c
+						local pa, pb, pc = math.abs(pp - a), math.abs(pp - up), math.abs(pp - c)
+						local pr = (pa <= pb and pa <= pc) and a or (pb <= pc and up or c)
+						buffer.writeu8(raw, cur + x, (buffer.readu8(raw, cur + x) + pr) % 256)
+					end
+				elseif f > 4 then
+					return nil, "плохой фильтр строки"
+				end
+			end
+			if yield then yield() end
+		end
+	end
+	-- пиксели -> RGBA
+	local px = buffer.create(w * h * 4)
+	local maxv = bit32.lshift(1, depth) - 1
+	local function sample(row, k)                           -- k-й отсчёт строки при глубине depth
+		if depth == 8 then return buffer.readu8(raw, row + k) end
+		if depth == 16 then return buffer.readu8(raw, row + 2 * k) end   -- старший байт
+		local bitpos = k * depth
+		local byte = buffer.readu8(raw, row + bitpos // 8)
+		return bit32.band(bit32.rshift(byte, 8 - depth - bitpos % 8), maxv)
+	end
+	local function scale(v) return depth >= 8 and v or (v * 255) // maxv end
+	-- прозрачный цвет-ключ (gray/RGB): сравнение по исходным значениям
+	local key
+	if trns and (ctype == 0 or ctype == 2) then
+		key = {}
+		for i = 0, (ctype == 0 and 0 or 2) do
+			local v = buffer.readu8(trns, 2 * i) * 256 + buffer.readu8(trns, 2 * i + 1)
+			key[i + 1] = depth == 16 and v or v
+		end
+	end
+	local function rawSample(row, k)                         -- для сравнения с ключом
+		if depth == 16 then return buffer.readu8(raw, row + 2 * k) * 256 + buffer.readu8(raw, row + 2 * k + 1) end
+		return sample(row, k)
+	end
+	for i, ps in ipairs(passes) do
+		local pw, ph, rowBytes, base = dims[i][1], dims[i][2], dims[i][3], dims[i][4]
+		if pw > 0 and ph > 0 then
+			for y = 0, ph - 1 do
+				local row = base + y * (rowBytes + 1) + 1
+				local yy = ps[2] + y * ps[4]
+				for x = 0, pw - 1 do
+					local xx = ps[1] + x * ps[3]
+					local r, g, bl, a = 0, 0, 0, 255
+					if ctype == 0 then
+						local v = sample(row, x); r = scale(v); g, bl = r, r
+						if key and rawSample(row, x) == key[1] then a = 0 end
+					elseif ctype == 2 then
+						r, g, bl = sample(row, 3 * x), sample(row, 3 * x + 1), sample(row, 3 * x + 2)
+						if key and rawSample(row, 3 * x) == key[1] and rawSample(row, 3 * x + 1) == key[2]
+							and rawSample(row, 3 * x + 2) == key[3] then a = 0 end
+					elseif ctype == 3 then
+						local idx = sample(row, x)
+						if 3 * idx + 2 < buffer.len(plte) then
+							r, g, bl = buffer.readu8(plte, 3 * idx), buffer.readu8(plte, 3 * idx + 1), buffer.readu8(plte, 3 * idx + 2)
+						end
+						if trns and idx < buffer.len(trns) then a = buffer.readu8(trns, idx) end
+					elseif ctype == 4 then
+						r = sample(row, 2 * x); g, bl = r, r; a = sample(row, 2 * x + 1)
+					else
+						r, g, bl, a = sample(row, 4 * x), sample(row, 4 * x + 1), sample(row, 4 * x + 2), sample(row, 4 * x + 3)
+					end
+					local o = (yy * w + xx) * 4
+					buffer.writeu8(px, o, r); buffer.writeu8(px, o + 1, g); buffer.writeu8(px, o + 2, bl); buffer.writeu8(px, o + 3, a)
+				end
+			end
+		end
+	end
+	return { w = w, h = h, px = px }
+end
+
+-- ---------- BMP ----------
+local function u32le(b, o) return buffer.readu32(b, o) end
+local function decodeBMP(b)
+	if buffer.len(b) < 54 then return nil, "файл оборван" end
+	local off = u32le(b, 10)
+	local hsz = u32le(b, 14)
+	local w = buffer.readi32(b, 18)
+	local hh = buffer.readi32(b, 22)
+	local bpp = buffer.readu16(b, 28)
+	local comp = u32le(b, 30)
+	if comp ~= 0 and comp ~= 3 then return nil, "сжатый BMP не поддержан — сохрани как PNG" end
+	if bpp ~= 8 and bpp ~= 24 and bpp ~= 32 then return nil, ("BMP %d бит не поддержан — сохрани как PNG"):format(bpp) end
+	local topDown = hh < 0
+	local h = math.abs(hh)
+	if w <= 0 or h == 0 or w * h > 16000000 then return nil, "странный размер" end
+	local stride = ((w * bpp + 31) // 32) * 4
+	if off + stride * h > buffer.len(b) then return nil, "файл оборван" end
+	local pal = 14 + hsz
+	local px = buffer.create(w * h * 4)
+	local alpha = false
+	if bpp == 32 then                                      -- есть ли альфа (часто все нули — тогда непрозрачно)
+		for y = 0, h - 1 do
+			for x = 0, w - 1 do
+				if buffer.readu8(b, off + y * stride + x * 4 + 3) ~= 0 then alpha = true; break end
+			end
+			if alpha then break end
+		end
+	end
+	for y = 0, h - 1 do
+		local row = off + (topDown and y or (h - 1 - y)) * stride
+		for x = 0, w - 1 do
+			local r, g, bl, a
+			if bpp == 8 then
+				local idx = buffer.readu8(b, row + x)
+				bl, g, r = buffer.readu8(b, pal + idx * 4), buffer.readu8(b, pal + idx * 4 + 1), buffer.readu8(b, pal + idx * 4 + 2)
+				a = 255
+			else
+				local q = row + x * (bpp // 8)
+				bl, g, r = buffer.readu8(b, q), buffer.readu8(b, q + 1), buffer.readu8(b, q + 2)
+				a = (bpp == 32 and alpha) and buffer.readu8(b, q + 3) or 255
+			end
+			local o = (y * w + x) * 4
+			buffer.writeu8(px, o, r); buffer.writeu8(px, o + 1, g); buffer.writeu8(px, o + 2, bl); buffer.writeu8(px, o + 3, a)
+		end
+	end
+	return { w = w, h = h, px = px }
+end
+
+function Img.decode(bytes, yield)
+	local b = buffer.fromstring(bytes)
+	local n = buffer.len(b)
+	if n >= 8 and buffer.readstring(b, 0, 8) == "\137PNG\r\n\26\n" then return decodePNG(b, yield) end
+	if n >= 2 and buffer.readstring(b, 0, 2) == "BM" then return decodeBMP(b) end
+	if n >= 3 and buffer.readu8(b, 0) == 255 and buffer.readu8(b, 1) == 216 then return nil, "JPG пока не умею — сохрани картинку как PNG" end
+	if n >= 12 and buffer.readstring(b, 0, 4) == "RIFF" and buffer.readstring(b, 8, 4) == "WEBP" then
+		return nil, "WEBP не умею — сохрани картинку как PNG"
+	end
+	if n >= 5 and buffer.readstring(b, 0, 5):lower():find("<") then return nil, "это не картинка (похоже на страницу сайта)" end
+	return nil, "не PNG и не BMP"
+end
+
+-- ---------- уменьшение / увеличение: среднее по клетке ----------
+function Img.resample(img, W, H, yield)
+	local w, h, src = img.w, img.h, img.px
+	local out = buffer.create(W * H * 4)
+	local x0s, x1s = table.create(W, 0), table.create(W, 0)
+	for tx = 0, W - 1 do
+		local a = (tx * w) // W
+		local b = ((tx + 1) * w) // W
+		x0s[tx + 1] = a; x1s[tx + 1] = math.max(a + 1, b)
+	end
+	for ty = 0, H - 1 do
+		local y0 = (ty * h) // H
+		local y1 = math.max(y0 + 1, ((ty + 1) * h) // H)
+		for tx = 0, W - 1 do
+			local sr, sg, sb, sa, cnt = 0, 0, 0, 0, 0
+			for y = y0, y1 - 1 do
+				local o = (y * w + x0s[tx + 1]) * 4
+				for _ = x0s[tx + 1], x1s[tx + 1] - 1 do
+					local a = buffer.readu8(src, o + 3)
+					sr += buffer.readu8(src, o) * a; sg += buffer.readu8(src, o + 1) * a; sb += buffer.readu8(src, o + 2) * a
+					sa += a; cnt += 1
+					o += 4
+				end
+			end
+			local q = (ty * W + tx) * 4
+			if sa > 0 then
+				buffer.writeu8(out, q, math.floor(sr / sa + 0.5)); buffer.writeu8(out, q + 1, math.floor(sg / sa + 0.5))
+				buffer.writeu8(out, q + 2, math.floor(sb / sa + 0.5))
+			end
+			buffer.writeu8(out, q + 3, math.floor(sa / cnt + 0.5))
+		end
+		if yield and ty % 16 == 15 then yield() end
+	end
+	return out
+end
+
+-- ---------- меньше цветов: медианное сечение ----------
+function Img.quantize(px, W, H, n)
+	local idx = {}
+	for i = 0, W * H - 1 do
+		if buffer.readu8(px, i * 4 + 3) >= 128 then table.insert(idx, i) end
+	end
+	local out = buffer.create(W * H * 4)
+	buffer.copy(out, 0, px, 0, W * H * 4)
+	if #idx == 0 then return out, 0 end
+	local function ch(i, c) return buffer.readu8(px, i * 4 + c) end
+	local boxes = { idx }
+	local function range(box)
+		local best, bc = -1, 0
+		for c = 0, 2 do
+			local lo, hi = 255, 0
+			for _, i in ipairs(box) do
+				local v = ch(i, c)
+				if v < lo then lo = v end
+				if v > hi then hi = v end
+			end
+			if hi - lo > best then best, bc = hi - lo, c end
+		end
+		return best, bc
+	end
+	while #boxes < n do
+		local pick, pr, pc = nil, 0, 0
+		for k, box in ipairs(boxes) do
+			if #box > 1 then
+				local r, c = range(box)
+				if r > pr then pick, pr, pc = k, r, c end
+			end
+		end
+		if not pick then break end
+		local box = boxes[pick]
+		table.sort(box, function(a, b) return ch(a, pc) < ch(b, pc) end)
+		local mid = #box // 2
+		local A, B = table.create(mid), table.create(#box - mid)
+		for k = 1, mid do A[k] = box[k] end
+		for k = mid + 1, #box do B[k - mid] = box[k] end
+		boxes[pick] = A; table.insert(boxes, B)
+	end
+	for _, box in ipairs(boxes) do
+		local r, g, b = 0, 0, 0
+		for _, i in ipairs(box) do r += ch(i, 0); g += ch(i, 1); b += ch(i, 2) end
+		r, g, b = math.floor(r / #box + 0.5), math.floor(g / #box + 0.5), math.floor(b / #box + 0.5)
+		for _, i in ipairs(box) do
+			buffer.writeu8(out, i * 4, r); buffer.writeu8(out, i * 4 + 1, g); buffer.writeu8(out, i * 4 + 2, b)
+		end
+	end
+	return out, #boxes
+end
+
+-- ---------- одинаковые соседи -> прямоугольники ----------
+function Img.rects(px, W, H, merge, maxW, maxH)
+	local function key(i)
+		if buffer.readu8(px, i * 4 + 3) < 128 then return -1 end
+		return buffer.readu8(px, i * 4) * 65536 + buffer.readu8(px, i * 4 + 1) * 256 + buffer.readu8(px, i * 4 + 2)
+	end
+	local out, colors = {}, {}
+	local function hex(k)
+		return string.format("%02x%02x%02x", k // 65536, (k // 256) % 256, k % 256)
+	end
+	if not merge then
+		for y = 0, H - 1 do
+			for x = 0, W - 1 do
+				local k = key(y * W + x)
+				if k >= 0 then table.insert(out, { x, y, 1, 1, hex(k) }); colors[k] = true end
+			end
+		end
+	else
+		local open = {}                                   -- "x,w,k" -> прямоугольник, растущий вниз
+		for y = 0, H - 1 do
+			local seen = {}
+			local x = 0
+			while x < W do
+				local k = key(y * W + x)
+				local x2 = x + 1
+				while x2 < W and x2 - x < maxW and key(y * W + x2) == k do x2 += 1 end
+				if k >= 0 then
+					colors[k] = true
+					local id = x .. "," .. (x2 - x) .. "," .. k
+					local r = open[id]
+					if r and r[2] + r[4] == y and r[4] < maxH then
+						r[4] += 1
+					else
+						r = { x, y, x2 - x, 1, hex(k) }
+						table.insert(out, r); open[id] = r
+					end
+					seen[id] = true
+				end
+				x = x2
+			end
+			for id in pairs(open) do if not seen[id] then open[id] = nil end end
+		end
+	end
+	local nc = 0
+	for _ in pairs(colors) do nc += 1 end
+	return out, nc
+end
+
+-- ---------- прямоугольники -> детали постройки (координаты зоны, как в файлах .Build) ----------
+-- opt: kind, px (стад на пиксель), t (толщина), floor (лёжа на полу), y0 (пол площадки), units(kind, size) -> блоков
+function Img.place(rects, W, H, opt)
+	local p, t = opt.px, opt.t
+	local items, lo, hi = {}, { math.huge, math.huge, math.huge }, { -math.huge, -math.huge, -math.huge }
+	local need = 0
+	for i, r in ipairs(rects) do
+		local cx = (r[1] + r[3] / 2 - W / 2) * p
+		local cf, size
+		if opt.floor then
+			cf = { cx, opt.y0 + t / 2, (r[2] + r[4] / 2 - H / 2) * p, 1, 0, 0, 0, 1, 0, 0, 0, 1 }
+			size = { r[3] * p, t, r[4] * p }
+		else
+			cf = { cx, opt.y0 + (H - r[2] - r[4] / 2) * p, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 }
+			size = { r[3] * p, r[4] * p, t }
+		end
+		for d = 1, 3 do
+			lo[d] = math.min(lo[d], cf[d] - size[d] / 2); hi[d] = math.max(hi[d], cf[d] + size[d] / 2)
+		end
+		need += opt.units and opt.units(opt.kind, size) or 1
+		items[i] = { kind = opt.kind, cf = cf, size = size, color = r[5], tr = 0, id = i, anchored = true, cc = true, cs = true, mv = {} }
+	end
+	return items, need, lo, hi
+end
+end
+-- <<< img_core
 
 -- ===== предпросмотр: призрак постройки, только у тебя (детали создаются на клиенте, на сервер ничего не уходит) =====
 -- Расположение: мир = зона * T(центр + сдвиг) * поворот(rot·90° вокруг y) * T(-центр) * CFrame_из_файла.
@@ -424,7 +971,7 @@ function Preview.show(info, progress)
 					elseif d:IsA("Script") or d:IsA("LocalScript") or d:IsA("ModuleScript") or d:IsA("Sound") then d:Destroy() end
 				end
 				if m.PrimaryPart then
-					if SCALABLE[it.kind] then m.PrimaryPart.Size = itemSize(it) end
+					if RESIZABLE[it.kind] then m.PrimaryPart.Size = itemSize(it) end
 					local off = m.PrimaryPart.CFrame:ToObjectSpace(m:GetPivot())   -- в файле — CFrame главной детали
 					m:PivotTo(cf * off)
 					if type(it.color) == "string" then
@@ -478,6 +1025,30 @@ end
 
 local WHITE = Color3.new(1, 1, 1)
 local gui = new("ScreenGui", { Name = "BABFT_Loader", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Parent = parentGui })
+
+-- подсказка при наведении: через полсекунды под элементом (поверх окна)
+local tipBox = new("Frame", { BackgroundColor3 = C.panel, AutomaticSize = Enum.AutomaticSize.XY, Visible = false, ZIndex = 50, Parent = gui },
+	{ corner(7), pad(9, 6) })
+do local st = stroke(C.stroke, 1, 0.2); st.Parent = tipBox end
+local tipText = label("", 11, C.text, false, { Size = UDim2.fromOffset(220, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
+	TextTruncate = Enum.TextTruncate.None, ZIndex = 51, Parent = tipBox })
+local tipToken = 0
+local function tip(obj, text)
+	obj.MouseEnter:Connect(function()
+		tipToken += 1
+		local my = tipToken
+		task.delay(0.45, function()
+			if my ~= tipToken or not obj.Parent then return end
+			local t = type(text) == "function" and text() or text
+			if not t or t == "" then return end
+			tipText.Text = t
+			local a, sz = obj.AbsolutePosition, obj.AbsoluteSize
+			tipBox.Position = UDim2.fromOffset(a.X, a.Y + sz.Y + 6)
+			tipBox.Visible = true
+		end)
+	end)
+	obj.MouseLeave:Connect(function() tipToken += 1; tipBox.Visible = false end)
+end
 local W_FULL, W_COMPACT, H, HEAD = 860, 628, 650, 48
 local minimized, hidden = false, false
 local function winWidth() return settings.compact and W_COMPACT or W_FULL end
@@ -611,6 +1182,7 @@ local function segmented(parent, pos, size, items, accentPill, onPick)
 		b.MouseButton1Click:Connect(function() onPick(i) end)
 		btns[i] = b
 	end
+	seg.buttons = btns
 	function seg.set(i, instant)
 		if seg.index == i then return end
 		seg.index = i
@@ -642,17 +1214,24 @@ end
 
 -- ----- левая колонка: папка и файлы -----
 local left, leftIn = panel(12, 220, 10)
-caption("Папка", leftIn, 0)
-local folderBox = field(leftIn, 16, settings.folder, "Butter-Builds")
+-- вкладки: что строим / откуда берём. Страницы ниже, переключение — showTab (объявлена в конце раздела «Копия»)
+local showTab
+local tabSeg = segmented(leftIn, UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 28), { "Файлы", "Картинка", "Копия" }, true,
+	function(i) showTab(i) end)
+local function page() return new("Frame", { BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 38),
+	Size = UDim2.new(1, 0, 1, -38), Visible = false, Parent = leftIn }) end
+local pageFiles, pageImage, pageCopy = page(), page(), page()
+caption("Папка", pageFiles, 0)
+local folderBox = field(pageFiles, 16, settings.folder, "Butter-Builds")
 local chips = new("ScrollingFrame", { BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 24), Position = UDim2.fromOffset(0, 52),
 	ScrollBarThickness = 0, ScrollingDirection = Enum.ScrollingDirection.X, AutomaticCanvasSize = Enum.AutomaticSize.X,
-	CanvasSize = UDim2.new(), Parent = leftIn },
+	CanvasSize = UDim2.new(), Parent = pageFiles },
 	{ new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), VerticalAlignment = Enum.VerticalAlignment.Center }) })
-local search = field(leftIn, 84, "", "Поиск постройки")
-local filesCap = caption("Постройки", leftIn, 124)
+local search = field(pageFiles, 84, "", "Поиск постройки")
+local filesCap = caption("Постройки", pageFiles, 124)
 local fileList = new("ScrollingFrame", { BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(0, 140),
 	Size = UDim2.new(1, 0, 1, -140), ScrollBarThickness = 3, ScrollBarImageColor3 = C.stroke, AutomaticCanvasSize = Enum.AutomaticSize.Y,
-	CanvasSize = UDim2.new(), Parent = leftIn }, { new("UIListLayout", { Padding = UDim.new(0, 2) }) })
+	CanvasSize = UDim2.new(), Parent = pageFiles }, { new("UIListLayout", { Padding = UDim.new(0, 2) }) })
 
 -- ----- середина: карточка, режим, расположение, этапы -----
 local mid, midIn = panel(244, 340, 12)
@@ -916,21 +1495,17 @@ local function markSelected()
 		tween(fb.t, { TextColor3 = on and C.text or C.muted }, 0.2)
 	end
 end
-local function selectFile(f)
-	selectedPath, selectedName = f.path, f.name
-	markSelected()
-	title.Text = f.name
-	title.TextTransparency = 1
-	tween(title, { TextTransparency = 0 }, 0.3)
-	subLabel.Text = "читаю…"; subLabel.TextColor3 = C.muted
-	task.spawn(function()
-		local info, err = parseBuild(f.path)
-		if selectedPath ~= f.path then return end              -- пока читали, выбрали другой файл
-		currentInfo = info
+-- показать постройку в карточке, справа и призраком; keep — не сбрасывать сдвиг/поворот (картинка пересчиталась)
+local function showInfo(info, err, keep)
+	currentInfo = info
+	if keep and Preview.info then
+		Preview.info = info
+	else
 		Preview.clear(); Preview.info = info; Preview.offset = Vector3.zero; Preview.rot = 0
-		if info then rebuildPreview() else refreshPlacement() end
-		if not info then
-			subLabel.Text = err; subLabel.TextColor3 = C.bad
+	end
+	if info then rebuildPreview() else refreshPlacement() end
+	if not info then
+			subLabel.Text = err or "—"; subLabel.TextColor3 = C.bad
 			for i = 1, 3 do statVals[i].Text = "—"; statVals[i]:SetAttribute("n", 0) end
 		else
 			local kinds = 0
@@ -939,11 +1514,28 @@ local function selectFile(f)
 			if info.parts > 0 then
 				size = ("%s × %s × %s стад"):format(fmt(info.hi[1] - info.lo[1]), fmt(info.hi[2] - info.lo[2]), fmt(info.hi[3] - info.lo[3]))
 			end
-			subLabel.Text = ("деталей %s · размер %s"):format(fmt(info.parts), size)
+			subLabel.Text = info.note or ("деталей %s · размер %s"):format(fmt(info.parts), size)
 			subLabel.TextColor3 = C.muted
 			countTo(statVals[1], info.blocks); countTo(statVals[2], info.links); countTo(statVals[3], kinds, 0.4)
 		end
 		renderBlocks()
+end
+local function setTitle(t)
+	if title.Text == t then return end
+	title.Text = t
+	title.TextTransparency = 1
+	tween(title, { TextTransparency = 0 }, 0.3)
+end
+local function selectFile(f)
+	if Engine.running then say("Идёт стройка — выбрать другое можно после «Стоп».", C.warn); return end
+	selectedPath, selectedName = f.path, f.name
+	markSelected()
+	setTitle(f.name)
+	subLabel.Text = "читаю…"; subLabel.TextColor3 = C.muted
+	task.spawn(function()
+		local info, err = parseBuild(f.path)
+		if selectedPath ~= f.path then return end              -- пока читали, выбрали другой файл
+		showInfo(info, err)
 	end)
 end
 onAccent(function() if selectedPath then markSelected() end end)
@@ -1010,6 +1602,575 @@ for _, n in ipairs(listFolders()) do
 	interactive(chip, C.row)
 	chip.MouseButton1Click:Connect(function() folderBox.Text = n; loadFolder(n) end)
 	chipBtns[n] = { b = chip, s = s }
+end
+
+-- ----- копия постройки с участка (своего или чужого) -> файл .Build (0.14) -----
+-- Всё берётся из моделей на участке (workspace.Blocks[имя]): тип = имя модели, место/размер/цвет — главная деталь
+-- (CFrame относительно зоны хозяина, как в файлах Butter), настройки — значения внутри модели, связи — ControllerRef
+-- у получателя (ссылка на источник); клавиша сиденья — Bind-значение получателя. Только чтение, на сервер ничего.
+local Copy = {}
+local MV_NUM = { WaitDuration = "WaitDuration", Speed = "Speed", ExtendLength = "ExtendLength", SemitoneOffset = "Key" }
+local MV_BOOL = { "Additive", "Not", "Or", "And", "Xor", "NoWelds" }
+local BIND_NAMES = { "BindFire", "BindUp", "BindDown", "BindLeft", "BindRight" }
+local function r4(x) return math.floor(x * 10000 + 0.5) / 10000 end
+function Copy.owners()                                       -- у кого на участке есть блоки (ты — первым)
+	local out = {}
+	local blocks = workspace:FindFirstChild("Blocks")
+	if blocks then
+		for _, f in ipairs(blocks:GetChildren()) do
+			local n = 0
+			for _, m in ipairs(f:GetChildren()) do if m:IsA("Model") then n += 1 end end
+			if n > 0 then table.insert(out, { name = f.Name, n = n, me = f.Name == lp.Name }) end
+		end
+	end
+	table.sort(out, function(a, b)
+		if a.me ~= b.me then return a.me end
+		return a.name:lower() < b.name:lower()
+	end)
+	return out
+end
+local function zoneOf(name)
+	local plr = Players:FindFirstChild(name)
+	return plr and workspace:FindFirstChild(tostring(plr.TeamColor) .. "Zone") or nil
+end
+local function bindKey(m)                                    -- клавиша, на которую получатель слушает сиденье
+	for _, n in ipairs(BIND_NAMES) do
+		local v = m:FindFirstChild(n)
+		if v and v:IsA("ValueBase") and type(v.Value) == "number" and v.Value ~= -1 then return v.Value end
+	end
+	return -1
+end
+function Copy.snapshot(owner, onProgress)
+	local blocks = workspace:FindFirstChild("Blocks")
+	local folder = blocks and blocks:FindFirstChild(owner)
+	if not folder then return nil, "у игрока нет блоков на участке" end
+	local zone = zoneOf(owner) or myZone()
+	if not zone then return nil, "не нашёл зону участка" end
+	local base = zone.CFrame
+	local list, ids = {}, {}
+	for _, m in ipairs(folder:GetChildren()) do
+		local pp = m:IsA("Model") and (m.PrimaryPart or m:FindFirstChild("PPart"))
+		if pp and pp:IsA("BasePart") then table.insert(list, { m = m, pp = pp }); ids[m] = #list end
+	end
+	if #list == 0 then return nil, "на участке пусто" end
+	local data, links = {}, 0
+	for i, e in ipairs(list) do
+		local m, pp = e.m, e.pp
+		local c = { base:ToObjectSpace(pp.CFrame):GetComponents() }
+		for k = 1, 12 do c[k] = r4(c[k]) end
+		local sz = pp.Size
+		local b = { ID = i, CFrame = c, Size = { r4(sz.X), r4(sz.Y), r4(sz.Z) }, Color = pp.Color:ToHex(),
+			Transparency = r4(tonumber(m:GetAttribute("Transparency")) or 0), Anchored = pp.Anchored,
+			CanCollide = not m:HasTag("NotCanCollideByTool"), CastShadow = pp.CastShadow }
+		local mv = {}
+		for child, key in pairs(MV_NUM) do
+			local v = m:FindFirstChild(child)
+			if v and v:IsA("ValueBase") and type(v.Value) == "number" then mv[key] = r4(v.Value) end
+		end
+		for _, n in ipairs(MV_BOOL) do
+			local v = m:FindFirstChild(n)
+			if v and v:IsA("BoolValue") then mv[n] = v.Value end
+		end
+		if m:HasTag("Legacy") then mv.Legacy = true end
+		local okD, dens = pcall(function() return pp.CurrentPhysicalProperties.Density end)
+		if okD and type(dens) == "number" then mv.Density = r4(dens) end
+		b.MValues = mv
+		local binds, key = {}, nil
+		for _, ch in ipairs(m:GetChildren()) do
+			if ch.Name == "ControllerRef" and ch:IsA("ObjectValue") and ch.Value and ids[ch.Value] then
+				local src, k = ch.Value, -1
+				if src:HasTag("SeatInput") then key = key or bindKey(m); k = key end
+				table.insert(binds, { ids[src], "BindFire", k })
+			end
+		end
+		if #binds > 0 then b.Binds = binds; links += #binds end
+		data[m.Name] = data[m.Name] or {}
+		table.insert(data[m.Name], b)
+		if i % 250 == 0 then
+			if onProgress then onProgress(i, #list) end
+			task.wait()
+		end
+	end
+	return { Data = data, AutoBuild_Version = "v1" }, #list, links
+end
+local function safeName(str)
+	local out = (str or ""):gsub('[\\/:*?"<>|%c]', "_"):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%.[Bb][Uu][Ii][Ll][Dd]$", "")
+	return out
+end
+-- записать постройку в папку построек: имя занято — _2, _3… (старое не затирается)
+local function saveBuildFile(name, tbl, fallback)
+	local folder = (settings.folder and settings.folder ~= "") and settings.folder or "Butter-Builds"
+	if isfolder and makefolder and not isfolder(folder) then pcall(makefolder, folder) end
+	name = safeName(name)
+	if name == "" then name = fallback or ("build_" .. os.date("%m%d_%H%M")) end
+	local path, k = folder .. "/" .. name .. ".Build", 1
+	while isfile and isfile(path) do k += 1; path = ("%s/%s_%d.Build"):format(folder, name, k) end
+	local ok, text = pcall(function() return HttpService:JSONEncode(tbl) end)
+	if not ok then return nil, "не получилось собрать файл" end
+	local okW, err = pcall(writefile, path, text)
+	if not okW then return nil, "не записался файл: " .. tostring(err) end
+	return path
+end
+function Copy.save(owner, name, onProgress)
+	local tbl, n, links = Copy.snapshot(owner, onProgress)
+	if not tbl then return nil, n end
+	local path, err = saveBuildFile(name, tbl, owner .. "_" .. os.date("%m%d_%H%M"))
+	if not path then return nil, err end
+	Log.w("COPY %s -> %s: деталей %d, связей %d", owner, path, n, links)
+	return path, n, links
+end
+
+do                                                           -- вкладки «Копия» и «Картинка»: переменные внутри блока
+-- ----- вкладка «Копия»: снять постройку с участка в файл -----
+caption("Чья постройка", pageCopy, 0)
+local copyRefresh = smallBtn(pageCopy, "обновить", 0, 0, 64, 18)
+copyRefresh.Position = UDim2.new(1, -64, 0, -3); copyRefresh.TextSize = 11
+tip(copyRefresh, "Перечитать, у кого сейчас есть блоки на участке")
+local ownerList = new("ScrollingFrame", { BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(0, 18),
+	Size = UDim2.new(1, 0, 1, -170), ScrollBarThickness = 3, ScrollBarImageColor3 = C.stroke, AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(), Parent = pageCopy }, { new("UIListLayout", { Padding = UDim.new(0, 3) }) })
+local copyBottom = new("Frame", { BackgroundTransparency = 1, Position = UDim2.new(0, 0, 1, -144), Size = UDim2.new(1, 0, 0, 144), Parent = pageCopy })
+caption("Имя файла", copyBottom, 0)
+local copyName = field(copyBottom, 16, "", "имя файла")
+local copyHolder = new("Frame", { BackgroundColor3 = WHITE, Position = UDim2.fromOffset(0, 56), Size = UDim2.new(1, 0, 0, 32),
+	Parent = copyBottom }, { corner(9) })
+accentGradient(copyHolder, 0)
+local copySave = new("TextButton", { Text = "Сохранить в файл", TextSize = 13, Font = FONT_H, TextColor3 = WHITE, BackgroundTransparency = 1,
+	AutoButtonColor = false, Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = copyHolder })
+tip(copySave, "Снять постройку выбранного игрока: блоки, цвета, настройки и связи. Файл появится во вкладке «Файлы».")
+local copyStatus = label("", 11, C.muted, false, { Position = UDim2.fromOffset(0, 96), Size = UDim2.new(1, 0, 0, 46),
+	TextWrapped = true, TextTruncate = Enum.TextTruncate.None, TextYAlignment = Enum.TextYAlignment.Top, Parent = copyBottom })
+
+local copyOwner, copyRows, copyBusy = nil, {}, false
+local function copyMark()
+	for name, row in pairs(copyRows) do
+		local on = name == copyOwner
+		tween(row.s, { Color = on and accent() or C.stroke, Transparency = on and 0 or 0.7 }, 0.2)
+		tween(row.t, { TextColor3 = on and C.text or C.muted }, 0.2)
+	end
+end
+onAccent(copyMark)
+local function copyPick(o)
+	copyOwner = o.name
+	copyName.Text = safeName(o.name) .. "_" .. os.date("%m%d_%H%M")
+	copyMark()
+end
+local function copyFill()
+	for _, c in ipairs(ownerList:GetChildren()) do
+		if c:IsA("TextButton") or c:IsA("TextLabel") then c:Destroy() end
+	end
+	copyRows = {}
+	local list = Copy.owners()
+	for i, o in ipairs(list) do
+		local b = new("TextButton", { Text = "", BackgroundColor3 = C.row, Size = UDim2.new(1, -6, 0, 32), LayoutOrder = i, Parent = ownerList }, { corner(8) })
+		local st = stroke(C.stroke, 1, 0.7); st.Parent = b
+		local t = label(o.name .. (o.me and "  · ты" or ""), 12, C.muted, true, { Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -86, 1, 0), Parent = b })
+		label(fmt(o.n) .. " бл.", 11, C.faint, false, { Position = UDim2.new(1, -76, 0, 0), Size = UDim2.fromOffset(68, 32),
+			TextXAlignment = Enum.TextXAlignment.Right, Parent = b })
+		interactive(b, C.row, { ghost = true, press = 0.98 })
+		b.MouseButton1Click:Connect(function() if not copyBusy then copyPick(o) end end)
+		copyRows[o.name] = { s = st, t = t }
+		if i <= 30 then appear(b, i * 0.02, 4) end
+	end
+	if #list == 0 then
+		label("ни у кого нет блоков на участке", 12, C.faint, false, { Size = UDim2.new(1, 0, 0, 28),
+			TextXAlignment = Enum.TextXAlignment.Center, Parent = ownerList })
+		copyOwner = nil
+	elseif not (copyOwner and copyRows[copyOwner]) then
+		copyPick(list[1])
+	end
+	copyMark()
+	if not copyBusy then
+		copyStatus.Text = ("Файл ляжет в папку «%s».\nМесто на участке сохранится, сдвинуть можно в превью."):format(settings.folder or "Butter-Builds")
+		copyStatus.TextColor3 = C.muted
+	end
+end
+copyRefresh.MouseButton1Click:Connect(function() if not copyBusy then copyFill() end end)
+copySave.MouseButton1Click:Connect(function()
+	if copyBusy then return end
+	if not copyOwner then copyStatus.Text = "Выбери, чью постройку копировать."; copyStatus.TextColor3 = C.warn; return end
+	copyBusy = true
+	copyStatus.Text = "Снимаю постройку…"; copyStatus.TextColor3 = C.muted
+	task.spawn(function()
+		local path, n, links = Copy.save(copyOwner, copyName.Text, function(i, total)
+			copyStatus.Text = ("Снимаю: %s из %s деталей…"):format(fmt(i), fmt(total))
+		end)
+		copyBusy = false
+		if not path then
+			copyStatus.Text = "Не вышло: " .. tostring(n); copyStatus.TextColor3 = C.bad
+			return
+		end
+		local short = path:match("([^/\\]+)$") or path
+		copyStatus.Text = ("Сохранено: %s\nдеталей %s, связей %s"):format(short, fmt(n), fmt(links))
+		copyStatus.TextColor3 = C.ok
+		say(("Копия сохранена: %s"):format(short), C.ok)
+		loadFolder(settings.folder or "Butter-Builds")
+	end)
+end)
+
+-- ----- вкладка «Картинка»: PNG/BMP -> плитки из выбранного блока -----
+local IMG_DIR = SETTINGS_DIR .. "/images"
+if type(settings.img) ~= "table" then settings.img = {} end
+local IS = settings.img
+IS.w = math.clamp(math.floor(tonumber(IS.w) or 48), 1, 256)
+IS.lock = IS.lock ~= false
+IS.px = tonumber(IS.px) or 1
+IS.t = tonumber(IS.t) or 0.4
+IS.floor = IS.floor == true
+IS.colors = math.clamp(math.floor(tonumber(IS.colors) or 2), 1, 4)
+IS.merge = IS.merge ~= false
+IS.kind = type(IS.kind) == "string" and IS.kind or "PlasticBlock"
+local COLORS_N = { 0, 32, 16, 8 }                           -- 0 — все цвета как есть
+local MAX_SIDE = 48                                          -- стад: длиннее плиту не склеиваем
+local imgCur = nil                                           -- { name, img = {w, h, px}, H }
+local imgRegen                                               -- ниже: пересчёт картинки
+
+local imgScroll = new("ScrollingFrame", { BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1),
+	ScrollBarThickness = 3, ScrollBarImageColor3 = C.stroke, CanvasSize = UDim2.fromOffset(0, 690), Parent = pageImage })
+local IW = -6                                                -- ширина содержимого: 1, IW (место под полосу прокрутки)
+caption("Картинка", imgScroll, 0)
+local imgChips = new("ScrollingFrame", { BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, IW, 0, 24), Position = UDim2.fromOffset(0, 16),
+	ScrollBarThickness = 0, ScrollingDirection = Enum.ScrollingDirection.X, AutomaticCanvasSize = Enum.AutomaticSize.X,
+	CanvasSize = UDim2.new(), Parent = imgScroll },
+	{ new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), VerticalAlignment = Enum.VerticalAlignment.Center }) })
+local urlBox = field(imgScroll, 46, "", "или ссылка на .png")
+urlBox.Size = UDim2.new(1, IW - 56, 0, 28)
+local urlBtn = smallBtn(imgScroll, "Взять", 0, 48, 50, 24)
+urlBtn.Position = UDim2.new(1, IW - 50, 0, 48)
+tip(urlBtn, "Скачать картинку по ссылке (PNG или BMP; JPG не подойдёт)")
+local pvBox = new("Frame", { BackgroundColor3 = Color3.fromRGB(14, 14, 18), Position = UDim2.fromOffset(0, 82), Size = UDim2.new(1, IW, 0, 188),
+	ClipsDescendants = true, Parent = imgScroll }, { corner(8) })
+local pvCanvas = new("Frame", { BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(0, 0), Parent = pvBox })
+local pvEmpty = label("Положи .png в папку\nworkspace/" .. IMG_DIR .. "\nили вставь ссылку выше", 11, C.muted, false,
+	{ Size = UDim2.fromScale(1, 1), TextWrapped = true, TextTruncate = Enum.TextTruncate.None, TextXAlignment = Enum.TextXAlignment.Center, Parent = pvBox })
+local imgInfo = label("", 11, C.muted, false, { Position = UDim2.fromOffset(0, 274), Size = UDim2.new(1, IW, 0, 14),
+	TextXAlignment = Enum.TextXAlignment.Center, Parent = imgScroll })
+
+caption("Блок", imgScroll, 296)
+local kindRow = new("ScrollingFrame", { BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, IW, 0, 40), Position = UDim2.fromOffset(0, 312),
+	ScrollBarThickness = 0, ScrollingDirection = Enum.ScrollingDirection.X, AutomaticCanvasSize = Enum.AutomaticSize.X,
+	CanvasSize = UDim2.new(), Parent = imgScroll },
+	{ new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), VerticalAlignment = Enum.VerticalAlignment.Center }) })
+local kindName = label("", 11, C.muted, false, { Position = UDim2.fromOffset(0, 354), Size = UDim2.new(1, IW, 0, 14), Parent = imgScroll })
+
+-- строки настроек: подпись слева, поля справа (x от 72)
+local function rowLabel(text, y, hint)
+	local l = label(text, 12, C.muted, false, { Position = UDim2.fromOffset(0, y), Size = UDim2.fromOffset(70, 26), Parent = imgScroll })
+	if hint then tip(l, hint) end
+	return l
+end
+local function numBox(x, y, w)
+	local box = new("TextBox", { Text = "", ClearTextOnFocus = false, TextSize = 12, Font = FONT_B, TextColor3 = C.text, BackgroundColor3 = C.row,
+		Size = UDim2.fromOffset(w, 26), Position = UDim2.fromOffset(x, y), Parent = imgScroll }, { corner(7) })
+	local st = stroke(C.stroke, 1, 0.5); st.Parent = box
+	box.Focused:Connect(function() tween(st, { Color = accent(), Transparency = 0 }, 0.2) end)
+	box.FocusLost:Connect(function() tween(st, { Color = C.stroke, Transparency = 0.5 }, 0.25) end)
+	return box
+end
+local function unitLabel(text, x, y)
+	return label(text, 11, C.faint, false, { Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(30, 26), Parent = imgScroll })
+end
+local Y0 = 376
+rowLabel("Пикселей", Y0, "Разрешение: сколько плиток по ширине и высоте. Больше — чётче, но блоков и времени больше.")
+local resW, resH = numBox(72, Y0, 42), numBox(126, Y0, 42)
+do local x = unitLabel("×", 114, Y0); x.Size = UDim2.fromOffset(12, 26); x.TextXAlignment = Enum.TextXAlignment.Center end
+resW.Size = UDim2.fromOffset(42, 26)
+local lockBtn = smallBtn(imgScroll, "", 172, Y0 + 1, 24, 24)
+tip(lockBtn, "Замок: держать пропорции картинки (высота считается сама)")
+rowLabel("Пиксель", Y0 + 32, "Сторона одной плитки в стадах")
+local pxBox = numBox(72, Y0 + 32, 52)
+unitLabel("стад", 130, Y0 + 32)
+rowLabel("Размер", Y0 + 64, "Размер всей картины в стадах = пикселей × пиксель. Поменяешь — пересчитается пиксель.")
+local szW, szH = numBox(72, Y0 + 64, 42), numBox(126, Y0 + 64, 42)
+do local x = unitLabel("×", 114, Y0 + 64); x.Size = UDim2.fromOffset(12, 26); x.TextXAlignment = Enum.TextXAlignment.Center end
+unitLabel("ст", 172, Y0 + 64)
+rowLabel("Толщина", Y0 + 96, "Толщина плиток в стадах")
+local tBox = numBox(72, Y0 + 96, 52)
+unitLabel("стад", 130, Y0 + 96)
+rowLabel("Ставить", Y0 + 128, "Стеной — картина стоит вертикально, лицом к +Z (смотрит не туда — «поворот» дважды); на пол — лежит, как ковёр")
+local floorSeg = segmented(imgScroll, UDim2.fromOffset(72, Y0 + 128), UDim2.fromOffset(122, 26), { "стеной", "на пол" }, false, function(i)
+	IS.floor = i == 2; saveSettings(); imgRegen(true)
+end)
+rowLabel("Цвета", Y0 + 160, "Меньше цветов — больше одинаковых соседей: меньше блоков, быстрее стройка, но грубее картинка")
+local colorSeg = segmented(imgScroll, UDim2.fromOffset(72, Y0 + 160), UDim2.fromOffset(122, 26), { "все", "32", "16", "8" }, false, function(i)
+	IS.colors = i; saveSettings(); imgRegen()
+end)
+rowLabel("Склеивать", Y0 + 192, "Соседние пиксели одного цвета ставятся одной растянутой плитой — блоков в разы меньше")
+local mergeSw = switch(imgScroll, UDim2.fromOffset(72, Y0 + 194), function(on) IS.merge = on; saveSettings(); imgRegen() end)
+label("одинаковые — одной плитой", 10, C.faint, false, { Position = UDim2.fromOffset(116, Y0 + 192), Size = UDim2.new(1, -116 + IW, 0, 26),
+	TextWrapped = true, TextTruncate = Enum.TextTruncate.None, Parent = imgScroll })
+local imgSave = smallBtn(imgScroll, "Сохранить как .Build", 0, Y0 + 232, 100, 30)
+imgSave.Size = UDim2.new(1, IW, 0, 30)
+tip(imgSave, "Записать картинку файлом постройки — потом её можно строить из вкладки «Файлы»")
+
+local function refreshFields()
+	resW.Text = tostring(IS.w)
+	resH.Text = imgCur and tostring(imgCur.H) or "—"
+	pxBox.Text = tostring(math.floor(IS.px * 100 + 0.5) / 100)
+	szW.Text = tostring(math.floor(IS.w * IS.px * 10 + 0.5) / 10)
+	szH.Text = imgCur and tostring(math.floor(imgCur.H * IS.px * 10 + 0.5) / 10) or "—"
+	tBox.Text = tostring(IS.t)
+	lockBtn.Text = IS.lock and "1:1" or "св"
+	lockBtn.TextColor3 = IS.lock and accent() or C.muted
+	floorSeg.set(IS.floor and 2 or 1, true)
+	colorSeg.set(IS.colors, true)
+	mergeSw.set(IS.merge)
+end
+
+-- 2D-превью: прямоугольники — рамками (много — грубее, по сетке до 96)
+local function drawPreview(px, W, H, rects)
+	for _, f in ipairs(pvCanvas:GetChildren()) do f:Destroy() end
+	pvEmpty.Visible = false
+	local S = math.min(180 / W, 180 / H)
+	pvCanvas.Size = UDim2.fromOffset(math.floor(W * S), math.floor(H * S))
+	local list, w2, h2 = rects, W, H
+	if #rects > 2500 then
+		w2, h2 = math.min(W, 96), math.min(H, 96)
+		local small = Img.resample({ w = W, h = H, px = px }, w2, h2)
+		list = Img.rects(small, w2, h2, true, 999, 999)
+		S = math.min(180 / w2, 180 / h2)
+	end
+	for _, r in ipairs(list) do
+		local x0, y0 = math.floor(r[1] * S), math.floor(r[2] * S)
+		new("Frame", { BorderSizePixel = 0, BackgroundColor3 = Color3.fromHex(r[5]), Position = UDim2.fromOffset(x0, y0),
+			Size = UDim2.fromOffset(math.max(1, math.floor((r[1] + r[3]) * S) - x0), math.max(1, math.floor((r[2] + r[4]) * S) - y0)),
+			Parent = pvCanvas })
+	end
+end
+
+local function unitsOf(kind, size)
+	if SCALABLE[kind] then return math.max(1, math.ceil(size[1] * size[2] * size[3] / 8 - 1e-9)) end
+	return 1
+end
+local regenToken = 0
+function imgRegen(keepNothing)                               -- пересчитать картинку -> постройку (с задержкой, последнее нажатие)
+	regenToken += 1
+	local my = regenToken
+	refreshFields()
+	if not imgCur then return end
+	task.delay(0.15, function()
+		if my ~= regenToken then return end
+		local img = imgCur.img
+		local W = IS.w
+		local H = imgCur.H
+		local t0 = os.clock()
+		local px = Img.resample(img, W, H, function() task.wait() end)
+		if my ~= regenToken then return end
+		local nColors = COLORS_N[IS.colors]
+		local ncol
+		if nColors > 0 then px, ncol = Img.quantize(px, W, H, nColors) end
+		local maxRun = math.max(1, math.floor(MAX_SIDE / IS.px))
+		local rects, nc = Img.rects(px, W, H, IS.merge, maxRun, maxRun)
+		if my ~= regenToken then return end
+		drawPreview(px, W, H, rects)
+		if #rects == 0 then
+			imgInfo.Text = "картинка вся прозрачная"; imgInfo.TextColor3 = C.bad
+			return
+		end
+		local items, need, lo, hi = Img.place(rects, W, H, { kind = IS.kind, px = IS.px, t = IS.t, floor = IS.floor, y0 = PLOT.y, units = unitsOf })
+		local info = { kinds = { [IS.kind] = need }, blocks = need, parts = #items, links = 0, items = items, lo = lo, hi = hi,
+			note = ("картинка %d×%d · цветов %d · %s × %s стад"):format(W, H, nc, fmt(W * IS.px), fmt(H * IS.px)) }
+		imgInfo.Text = ("%d × %d пикс · %s плиток · %.2f с"):format(W, H, fmt(#items), os.clock() - t0)
+		imgInfo.TextColor3 = #items > 6000 and C.warn or C.muted
+		imgCur.info = info
+		if Engine.running then return end                     -- во время стройки постройку не подменяем
+		selectedPath, selectedName = nil, "img_" .. imgCur.name:gsub("%.%w+$", "")
+		markSelected()
+		setTitle("Картинка: " .. imgCur.name)
+		showInfo(info, nil, not keepNothing)
+		if #items > 6000 then say(("Плиток %s — много: уменьши пиксели или цвета."):format(fmt(#items)), C.warn) end
+	end)
+end
+
+local function setHeightFromAspect()
+	if imgCur then imgCur.H = math.clamp(math.floor(IS.w * imgCur.img.h / imgCur.img.w + 0.5), 1, 256) end
+end
+local function num(box, lo, hi)
+	local v = tonumber((box.Text:gsub(",", ".")))
+	return v and math.clamp(v, lo, hi) or nil
+end
+resW.FocusLost:Connect(function()
+	local v = num(resW, 1, 256)
+	if v then IS.w = math.floor(v + 0.5); if IS.lock then setHeightFromAspect() end; saveSettings() end
+	imgRegen()
+end)
+resH.FocusLost:Connect(function()
+	local v = num(resH, 1, 256)
+	if v and imgCur then
+		imgCur.H = math.floor(v + 0.5)
+		if IS.lock then IS.w = math.clamp(math.floor(imgCur.H * imgCur.img.w / imgCur.img.h + 0.5), 1, 256) end
+		saveSettings()
+	end
+	imgRegen()
+end)
+lockBtn.MouseButton1Click:Connect(function()
+	IS.lock = not IS.lock; if IS.lock then setHeightFromAspect() end; saveSettings(); imgRegen()
+end)
+pxBox.FocusLost:Connect(function()
+	local v = num(pxBox, 0.1, 20); if v then IS.px = v; saveSettings() end; imgRegen()
+end)
+szW.FocusLost:Connect(function()
+	local v = num(szW, 0.1, 1000); if v then IS.px = math.clamp(v / IS.w, 0.1, 20); saveSettings() end; imgRegen()
+end)
+szH.FocusLost:Connect(function()
+	local v = num(szH, 0.1, 1000); if v and imgCur then IS.px = math.clamp(v / imgCur.H, 0.1, 20); saveSettings() end; imgRegen()
+end)
+tBox.FocusLost:Connect(function()
+	local v = num(tBox, 0.1, 10); if v then IS.t = v; saveSettings() end; imgRegen()
+end)
+
+-- выбор блока: плитки с иконками (растягиваемые: материалы и дисплей); сначала то, чего больше
+local kindTiles = {}
+local function markKinds()
+	for k, t in pairs(kindTiles) do
+		local on = k == IS.kind
+		tween(t.s, { Color = on and accent() or C.stroke, Transparency = on and 0 or 0.7, Thickness = on and 2 or 1 }, 0.2)
+	end
+	kindName.Text = ("%s · есть %s"):format(blockTitle(IS.kind), fmt(have(IS.kind)))
+end
+onAccent(markKinds)
+local function fillKinds()
+	for _, c in ipairs(kindRow:GetChildren()) do if c:IsA("GuiObject") then c:Destroy() end end
+	kindTiles = {}
+	local list = {}
+	for k in pairs(SCALABLE) do if have(k) > 0 or k == IS.kind or k == "PlasticBlock" then table.insert(list, k) end end
+	if have("DisplayBlock") > 0 or IS.kind == "DisplayBlock" then table.insert(list, "DisplayBlock") end
+	table.sort(list, function(a, b)
+		if a == "PlasticBlock" or b == "PlasticBlock" then return a == "PlasticBlock" end
+		return have(a) > have(b)
+	end)
+	for i, k in ipairs(list) do
+		local b = new("ImageButton", { Image = blockIcon(k), BackgroundColor3 = C.row, Size = UDim2.fromOffset(36, 36), LayoutOrder = i,
+			AutoButtonColor = false, Parent = kindRow }, { corner(8) })
+		local st = stroke(C.stroke, 1, 0.7); st.Parent = b
+		if b.Image == "" then
+			label(blockTitle(k):sub(1, 3), 10, C.muted, true, { Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center, Parent = b })
+		end
+		interactive(b, C.row)
+		tip(b, function() return ("%s — есть %s"):format(blockTitle(k), fmt(have(k))) end)
+		b.MouseButton1Click:Connect(function() IS.kind = k; saveSettings(); markKinds(); imgRegen() end)
+		kindTiles[k] = { s = st }
+	end
+	markKinds()
+end
+
+-- источник картинки: файлы из папки и ссылка
+local function openImage(name, getBytes)
+	imgInfo.Text = "читаю " .. name .. "…"; imgInfo.TextColor3 = C.muted
+	task.spawn(function()
+		local okB, bytes = pcall(getBytes)
+		if not okB or type(bytes) ~= "string" or #bytes == 0 then
+			imgInfo.Text = "не получилось прочитать: " .. tostring(bytes); imgInfo.TextColor3 = C.bad; return
+		end
+		local t0 = os.clock()
+		local ok, img, err = pcall(Img.decode, bytes, function() task.wait() end)
+		if not ok then err = img; img = nil end
+		if not img then imgInfo.Text = tostring(err); imgInfo.TextColor3 = C.bad; say("Картинка: " .. tostring(err), C.bad); return end
+		Log.w("IMG %s: %d×%d за %.2f с", name, img.w, img.h, os.clock() - t0)
+		imgCur = { name = name, img = img }
+		if IS.w > img.w * 4 then IS.w = math.min(256, img.w) end
+		setHeightFromAspect()
+		say(("Картинка %s: %d × %d"):format(name, img.w, img.h), C.ok)
+		imgRegen(true)
+	end)
+end
+local imgChipBtns = {}
+local function imgRefreshList()
+	if makefolder and isfolder and not isfolder(IMG_DIR) then pcall(makefolder, IMG_DIR) end
+	for _, c in ipairs(imgChips:GetChildren()) do if c:IsA("GuiObject") then c:Destroy() end end
+	imgChipBtns = {}
+	local ok, list = pcall(listfiles, IMG_DIR)
+	local n = 0
+	if ok and type(list) == "table" then
+		table.sort(list)
+		for _, p in ipairs(list) do
+			local name = p:match("([^/\\]+)$") or p
+			local low = name:lower()
+			if low:match("%.png$") or low:match("%.bmp$") or low:match("%.jpe?g$") then
+				n += 1
+				local chip = new("TextButton", { Text = name, TextSize = 11, Font = FONT_B, TextColor3 = C.muted, BackgroundColor3 = C.row,
+					AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 22), LayoutOrder = n, Parent = imgChips }, { corner(11), pad(9, 0) })
+				local st = stroke(C.stroke, 1, 0.6); st.Parent = chip
+				interactive(chip, C.row)
+				chip.MouseButton1Click:Connect(function()
+					for nm, c in pairs(imgChipBtns) do
+						tween(c.s, { Color = nm == name and accent() or C.stroke, Transparency = nm == name and 0 or 0.6 }, 0.2)
+						tween(c.b, { TextColor3 = nm == name and C.text or C.muted }, 0.2)
+					end
+					openImage(name, function() return readfile(p) end)
+				end)
+				imgChipBtns[name] = { b = chip, s = st }
+			end
+		end
+	end
+	if n == 0 then
+		label("в папке пусто", 11, C.faint, false, { AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 22), Parent = imgChips })
+	end
+	fillKinds()
+	refreshFields()
+end
+urlBtn.MouseButton1Click:Connect(function()
+	local url = urlBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+	if not url:match("^https?://") then imgInfo.Text = "нужна ссылка вида https://…"; imgInfo.TextColor3 = C.warn; return end
+	local name = (url:match("([^/?#]+)[?#]?[^/]*$") or "картинка"):sub(1, 40)
+	openImage(name, function()
+		local req = (syn and syn.request) or http_request or request
+		if req then
+			local r = req({ Url = url, Method = "GET" })
+			if r and r.Body and (r.StatusCode == nil or r.StatusCode < 400) then return r.Body end
+			error("сервер ответил " .. tostring(r and r.StatusCode))
+		end
+		return game:HttpGet(url)
+	end)
+end)
+imgSave.MouseButton1Click:Connect(function()
+	if not (imgCur and imgCur.info) then say("Сначала выбери картинку.", C.warn); return end
+	local data = {}
+	for _, it in ipairs(imgCur.info.items) do
+		data[it.kind] = data[it.kind] or {}
+		table.insert(data[it.kind], { ID = it.id, CFrame = it.cf, Size = it.size, Color = it.color, Transparency = 0,
+			Anchored = true, CanCollide = true, CastShadow = true, MValues = {} })
+	end
+	local base = imgCur.name:gsub("%.%w+$", "") .. ("_%dx%d"):format(IS.w, imgCur.H)
+	local path, err = saveBuildFile(base, { Data = data, AutoBuild_Version = "v1" }, base)
+	if not path then say("Не сохранилось: " .. tostring(err), C.bad); return end
+	say("Картинка сохранена: " .. (path:match("([^/\\]+)$") or path), C.ok)
+	loadFolder(settings.folder or "Butter-Builds")
+end)
+refreshFields()
+
+-- переключение вкладок (страница выезжает снизу на 8 пикселей)
+local pages = { pageFiles, pageImage, pageCopy }
+local TAB_TIPS = { "Постройки .Build из папки", "Построить картинку из блоков", "Снять постройку с участка в файл" }
+function showTab(i)
+	settings.tab = i; saveSettings()
+	tabSeg.set(i)
+	for k, pg in ipairs(pages) do
+		if k == i then
+			pg.Visible = true
+			pg.Position = UDim2.fromOffset(0, 46)
+			tween(pg, { Position = UDim2.fromOffset(0, 38) }, 0.25)
+		else
+			pg.Visible = false
+		end
+	end
+	if i == 2 then imgRefreshList() elseif i == 3 then copyFill() end
+end
+for k, b in ipairs(tabSeg.buttons or {}) do tip(b, TAB_TIPS[k]) end
+showTab(math.clamp(tonumber(settings.tab) or 1, 1, 3))
+
+-- подсказки к остальным кнопкам окна
+tip(startBtn, "Строить выбранное: блоки, размеры, краска, настройки, связи. Уже стоящие блоки заново не ставятся — можно перезапускать.")
+tip(pauseBtn, "Пауза: текущие запросы доделаются, новые — ждут")
+tip(stopBtn, "Остановить стройку")
+tip(fixBtn, "Найти на участке недостающие связи выбранной постройки и соединить их")
+tip(compactBtn, "Компактный вид: без левой колонки")
+tip(viewBtn, "Нужные блоки — списком или плиткой")
+tip(minBtn, "Свернуть окно до шапки")
+tip(stepBtn, "Шаг сдвига: 1, 5 или 10 стад")
+tip(rotBtn, "Повернуть постройку на 90°")
+tip(resetBtn, "Вернуть сдвиг и поворот как в файле")
 end
 
 -- ----- вид окна: компактный (без колонки файлов), свернуть, спрятать, открыть/закрыть -----
@@ -1306,9 +2467,12 @@ end
 local function settle(countLeft, label, grace)
 	grace = grace or GRACE
 	local t0, last, lastChange = os.clock(), countLeft(), os.clock()
-	while last > 0 and os.clock() - lastChange < grace and not Engine.stopFlag do
-		task.wait(0.25)
+	local cost = os.clock() - t0                             -- сколько стоит один подсчёт
+	while last > 0 and os.clock() - lastChange < grace + cost and not Engine.stopFlag do
+		task.wait(math.max(0.25, 2 * cost))
+		local c0 = os.clock()
 		local now = countLeft()
+		cost = os.clock() - c0
 		if now ~= last then last, lastChange = now, os.clock() end
 	end
 	Log.w("SETTLE %s: осталось %d (ждал %.1f с)", label, last, os.clock() - t0)
@@ -1418,7 +2582,7 @@ end
 
 -- 2. размеры (только растягиваемые)
 local function needScale(j)
-	if not SCALABLE[j.kind] or not j.model or not j.model:FindFirstChild("PPart") then return false end
+	if not RESIZABLE[j.kind] or not j.model or not j.model:FindFirstChild("PPart") then return false end
 	return (j.model.PPart.Size - itemSize(j.it)).Magnitude > 0.01
 end
 local function stageScale(job)
@@ -1581,7 +2745,19 @@ local function propOps(job, onlyAnchor)                     -- onlyAnchor: то�
 			end
 			flag("Additive", mv.Additive, bv("Additive"))
 			if type(mv.Legacy) == "boolean" then flag("Legacy", mv.Legacy, m:HasTag("Legacy")) end
-			for _, g in ipairs({ "Not", "Or", "Xor", "And" }) do flag(g, mv[g], bv(g)) end
+			flag("Not", mv.Not, bv("Not"))
+			-- режимы чипа Or / And / Xor: включение одного выключает другой (16.10, chip_lab2: переключали и Xor, и
+			-- And — второй отменял первый, 90 чипов остались AND). Поэтому включаем только нужный режим, а лишний
+			-- включённый гасим по одному за круг
+			local want
+			for _, g in ipairs({ "Or", "And", "Xor" }) do if mv[g] == true then want = g end end
+			if want and bv(want) == false then
+				add(want, nil, m)
+			else
+				for _, g in ipairs({ "Or", "And", "Xor" }) do
+					if mv[g] == false and bv(g) == true then add(g, nil, m); break end
+				end
+			end
 		end
 	end
 	return order
@@ -1683,7 +2859,8 @@ local function linkSet(r)
 end
 local function missingLinks(job)
 	local sets, out, seen = {}, {}, {}
-	for _, j in ipairs(job.items) do
+	for i, j in ipairs(job.items) do
+		if i % 2000 == 0 then task.wait() end                -- миллион связей — не замораживать кадр
 		if j.model and j.model.Parent and type(j.it.binds) == "table" then
 			for _, b in ipairs(j.it.binds) do
 				local src = job.byId[b[1]]
@@ -1694,7 +2871,7 @@ local function missingLinks(job)
 						seen[s] = seen[s] or {}
 						if not seen[s][r] then
 							seen[s][r] = true
-							table.insert(out, { s = s, r = r })
+							table.insert(out, { s = s, r = r, k = tonumber(b[3]) or -1 })
 						end
 					end
 				end
@@ -1702,6 +2879,26 @@ local function missingLinks(job)
 		end
 	end
 	return out
+end
+local function countMissing(job)                             -- то же число, что #missingLinks, но без списка пар
+	local n, done = 0, 0
+	for _, j in ipairs(job.items) do
+		local binds = j.it.binds
+		if j.model and j.model.Parent and type(binds) == "table" then
+			local set
+			for _, b in ipairs(binds) do
+				local src = job.byId[b[1]]
+				local sm = src and src.model
+				if sm and sm.Parent then
+					set = set or linkSet(j.model)
+					if not set[sm] then n += 1 end
+				end
+			end
+			done += #binds
+			if done > 20000 then done = 0; task.wait() end
+		end
+	end
+	return n
 end
 local function countLinks(job)
 	local n = 0
@@ -1722,7 +2919,7 @@ local BIND_GRACE = 1.5                                       -- сколько �
 local BIND_ROUNDS = 8                                        -- кругов максимум; без прогресса 2 круга подряд — стоп
 
 -- недостающие пары -> запросы { ss = источники, rs = получатели }; только точные пары, лишних связей не бывает
-local function bindTasks(todo)
+local function bindTasksPlain(todo)
 	local id, n = {}, 0
 	local function idOf(x)
 		if not id[x] then n += 1; id[x] = n end
@@ -1762,6 +2959,22 @@ local function bindTasks(todo)
 		for _, g in ipairs(bySrc) do table.insert(tasks, { ss = g.a, rs = g.b }) end
 	end
 	return tasks
+end
+
+-- связи с клавишей (сиденье -> блок, 16.10: бой с Сансом на WASD) идут отдельными запросами: в каждом одна клавиша
+local function bindTasks(todo)
+	local byKey, keys = {}, {}
+	for _, t in ipairs(todo) do
+		local k = t.k or -1
+		if not byKey[k] then byKey[k] = {}; table.insert(keys, k) end
+		table.insert(byKey[k], t)
+	end
+	if #keys == 1 and keys[1] == -1 then return bindTasksPlain(todo) end
+	local all = {}
+	for _, k in ipairs(keys) do
+		for _, task in ipairs(bindTasksPlain(byKey[k])) do task.k = k; table.insert(all, task) end
+	end
+	return all
 end
 
 local function where(m)
@@ -1838,7 +3051,12 @@ local function stageBinds(job)
 			sent += 1
 			Stat.inflight, Stat.sent, Stat.limit = inflight, Stat.sent + 1, 1 / gap   -- «предел» здесь — запросов в секунду
 			task.spawn(function()
-				local ok, err = pcall(function() return tool.RF:InvokeServer(inputs, t.ss, {}, false, false) end)
+				local keys, needKeys = {}, false
+				if t.k and t.k ~= -1 then
+					for action in pairs(inputs) do keys[action] = t.k end
+					needKeys = true
+				end
+				local ok, err = pcall(function() return tool.RF:InvokeServer(inputs, t.ss, keys, false, needKeys) end)
 				if running[rec] then close(rec, ok, err) end
 			end)
 			if i % 10 == 0 or i == #tasks then
@@ -1851,7 +3069,7 @@ local function stageBinds(job)
 		while inflight > 0 and os.clock() - t0 < BIND_TIMEOUT + 1 do task.wait(); reap() end
 		Log.w("ROUND связи %d: запросов %d, прошло %d, не прошло %d, связей сразу видно %d, интервал стал %.3f с",
 			round, sent, okN, badN, seenNow, gap)
-		settle(function() return #missingLinks(job) end, "связи", BIND_GRACE)
+		settle(function() return countMissing(job) end, "связи", BIND_GRACE)
 		todo = missingLinks(job)
 		setBar(5, (total - #todo) / total)
 		if before - #todo == 0 then idle += 1 else idle = 0 end
@@ -1918,7 +3136,7 @@ local function stageVerify(job)
 		if needPaint(j) then pt += 1 end
 	end
 	local pr = #propOps(job) + #propOps(job, true) + #noteSteps(job)
-	local ln = #missingLinks(job)
+	local ln = countMissing(job)
 	setBar(6, 1)
 	local r = { placed = placed, missing = missing, scale = sc, paint = pt, props = pr, links = ln, linksTotal = countLinks(job) }
 	Log.w("VERIFY блоков %d/%d, размер %d, краска %d, настройки %d, связей не хватает %d из %d",
@@ -2048,10 +3266,10 @@ function Engine.fixLinks()                                   -- только с�
 		if found == 0 then
 			return finish("На площадке нет блоков этой постройки там, где их показывает превью. Подвинь превью на постройку.", C.bad)
 		end
-		local before = #missingLinks(job)
+		local before = countMissing(job)
 		local ok, why = stageBinds(job)
 		if type(why) == "string" then return finish("Связи: " .. why, C.bad) end
-		local left = #missingLinks(job)
+		local left = countMissing(job)
 		finish(("Связи: не хватало %s, досоединено %s, осталось %s (блоков найдено %s из %s)"):format(
 			fmt(before), fmt(before - left), fmt(left), fmt(found), fmt(#job.items)), left == 0 and C.ok or C.warn)
 	end)
