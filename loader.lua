@@ -38,9 +38,13 @@ BABFT_Loader/logs/.
 пиксель, размер, толщина, стеной/на пол, меньше цветов, склейка одинаковых); подсказки при наведении.
 0.15.1: запускается старым компилятором loadstring (Solara): без «//», крупные разделы — в своих функциях
 (у него предел 200 регистров на функцию; проверка — luau-compile 0.590).
+0.16: JPG (обычный и прогрессивный, поворот по EXIF, большие фото — сразу 1/8); «Построить» во вкладке картинки —
+сразу, без файла; папка картинок проверяется раз в 2 с: новый файл с ПК открывается сам.
+0.17: турбо быстрее: старт с лучшего числа запросов прошлой стройки (или 48), разгон ×1.5 в секунду, потолок 256;
+краска пачками до 2000 (растут, пока сервер успевает); пока ставятся блоки — их же растягивают и красят (после пробы).
 ]]
 
-local VERSION = "0.15.1"
+local VERSION = "0.17"
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
@@ -339,7 +343,7 @@ local function have(name)
 end
 
 -- >>> img_core (17.10; без «//» — старый компилятор loadstring у Solara его не знает) — картинка -> постройка; только Luau (buffer, bit32), без Roblox API: проверяется luau.exe
--- Img.decode(bytes) -> { w, h, px = buffer RGBA (w*h*4) } | nil, ошибка      (PNG — все виды, BMP 8/24/32 бит)
+-- Img.decode(bytes) -> { w, h, px = buffer RGBA (w*h*4) } | nil, ошибка      (PNG — все виды, JPG обычный/прогрессивный, BMP 8/24/32)
 -- Img.resample(img, W, H, yield) -> buffer RGBA W×H (среднее по клетке, прозрачность учитывается)
 -- Img.quantize(px, W, H, n) -> buffer RGBA, число цветов (медианное сечение; прозрачные не трогает)
 -- Img.rects(px, W, H, merge, maxW, maxH) -> { {x, y, w, h, hex} } (одинаковые соседи — одним прямоугольником)
@@ -699,17 +703,495 @@ local function decodeBMP(b)
 	return { w = w, h = h, px = px }
 end
 
+-- ---------- JPEG: обычный и прогрессивный, любые прореживания цвета, перезапуски, поворот по EXIF (по мотивам pdf.js) ----------
+local decodeJPEG = (function()
+local ZZ = { 0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21,
+	28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63 }
+local COS = {}                                   -- COS[u*8 + x + 1] = c(u) * cos((2x+1)uπ/16) / 2
+for u = 0, 7 do
+	for x = 0, 7 do
+		COS[u * 8 + x + 1] = (u == 0 and 1 / math.sqrt(2) or 1) * math.cos((2 * x + 1) * u * math.pi / 16) / 2
+	end
+end
+
+local function buildHuff(counts, symbols)        -- canonical: mincode/maxcode/valptr по длинам 1..16
+	local mincode, maxcode, valptr = table.create(16, 0), table.create(16, -1), table.create(16, 0)
+	local code, k = 0, 0
+	for len = 1, 16 do
+		local n = counts[len]
+		if n > 0 then
+			valptr[len] = k; mincode[len] = code
+			code += n; k += n
+			maxcode[len] = code - 1
+		else
+			maxcode[len] = -1
+		end
+		code *= 2
+	end
+	return { mincode = mincode, maxcode = maxcode, valptr = valptr, vals = symbols }
+end
+
+local function exifOrientation(b, p, len)       -- APP1 «Exif»: тег 0x0112
+	if len < 14 or buffer.readstring(b, p, 6) ~= "Exif\0\0" then return 1 end
+	local t = p + 6
+	local le = buffer.readstring(b, t, 2) == "II"
+	local function u16(o) local x, y = buffer.readu8(b, o), buffer.readu8(b, o + 1); return le and x + y * 256 or x * 256 + y end
+	local function u32(o) return le and u16(o) + u16(o + 2) * 65536 or u16(o) * 65536 + u16(o + 2) end
+	local ifd = t + u32(t + 4)
+	if ifd + 2 > p + len then return 1 end
+	local n = u16(ifd)
+	for i = 0, n - 1 do
+		local e = ifd + 2 + i * 12
+		if e + 12 > p + len then break end
+		if u16(e) == 0x0112 then return u16(e + 8) end
+	end
+	return 1
+end
+
+return function(b, yield)
+	local n = buffer.len(b)
+	local pos = 2
+	local qt = {}
+	local dcT, acT = {}, {}
+	local frame, progressive
+	local resetInterval = 0
+	local adobe = nil
+	local orient = 1
+	local scans = 0
+	local function u16(o) return buffer.readu8(b, o) * 256 + buffer.readu8(b, o + 1) end
+
+	local function prepareFrame(f)
+		local maxH, maxV = 1, 1
+		for _, c in ipairs(f.comps) do maxH = math.max(maxH, c.h); maxV = math.max(maxV, c.v) end
+		f.maxH, f.maxV = maxH, maxV
+		f.mcusPerLine = math.ceil(f.w / (8 * maxH))
+		f.mcusPerColumn = math.ceil(f.h / (8 * maxV))
+		for _, c in ipairs(f.comps) do
+			c.blocksPerLine = math.ceil(math.ceil(f.w * c.h / maxH) / 8)
+			c.blocksPerColumn = math.ceil(math.ceil(f.h * c.v / maxV) / 8)
+			c.bplMcu = f.mcusPerLine * c.h
+			c.bpcMcu = f.mcusPerColumn * c.v
+			c.data = buffer.create(c.bplMcu * c.bpcMcu * 64 * 2)     -- коэффициенты, int16
+			c.pred = 0
+		end
+	end
+
+	-- ---------- энтропийное декодирование одного прохода ----------
+	local function decodeScan(comps, ss, se, ah, al)
+		local bitsData, bitsCount = 0, 0
+		local eobrun = 0
+		local acState, acNext = 0, 0
+		local function readBit()
+			if bitsCount > 0 then
+				bitsCount -= 1
+				return bit32.band(bit32.rshift(bitsData, bitsCount), 1)
+			end
+			if pos >= n then return 0 end
+			bitsData = buffer.readu8(b, pos)
+			if bitsData == 0xFF then
+				local nx = pos + 1 < n and buffer.readu8(b, pos + 1) or 0
+				if nx == 0 then pos += 2
+				else return 0 end                       -- маркер посреди данных: дальше не читаем
+			else
+				pos += 1
+			end
+			bitsCount = 7
+			return bit32.rshift(bitsData, 7)
+		end
+		local function receive(len)
+			local v = 0
+			for _ = 1, len do v = v * 2 + readBit() end
+			return v
+		end
+		local function extend(len)
+			if len == 0 then return 0 end
+			if len == 1 then return readBit() == 1 and 1 or -1 end
+			local v = receive(len)
+			if v >= 2 ^ (len - 1) then return v end
+			return v - 2 ^ len + 1
+		end
+		local function decodeHuff(t)
+			local code = 0
+			local mx, mn, vp, vals = t.maxcode, t.mincode, t.valptr, t.vals
+			for len = 1, 16 do
+				code = code * 2 + readBit()
+				if code <= mx[len] then return vals[vp[len] + code - mn[len] + 1] end
+			end
+			return 0                                     -- испорченный код: тихо ноль
+		end
+		local function get(c, o) return buffer.readi16(c.data, o * 2) end
+		local function set(c, o, v) buffer.writei16(c.data, o * 2, math.clamp(v, -32768, 32767)) end
+
+		local decode
+		if not progressive then
+			decode = function(c, off)
+				local t = decodeHuff(c.dc)
+				c.pred += t == 0 and 0 or extend(t)
+				set(c, off, c.pred)
+				local k = 1
+				while k < 64 do
+					local rs = decodeHuff(c.ac)
+					local s, r = rs % 16, math.floor(rs / 16)
+					if s == 0 then
+						if r < 15 then break end
+						k += 16
+					else
+						k += r
+						if k > 63 then break end
+						set(c, off + ZZ[k + 1], extend(s))
+						k += 1
+					end
+				end
+			end
+		elseif ss == 0 then
+			if ah == 0 then
+				decode = function(c, off)
+					local t = decodeHuff(c.dc)
+					c.pred += (t == 0 and 0 or extend(t)) * 2 ^ al
+					set(c, off, c.pred)
+				end
+			else
+				decode = function(c, off)
+					if readBit() == 1 then set(c, off, get(c, off) + 2 ^ al) end
+				end
+			end
+		elseif ah == 0 then
+			decode = function(c, off)
+				if eobrun > 0 then eobrun -= 1; return end
+				local k = ss
+				while k <= se do
+					local rs = decodeHuff(c.ac)
+					local s, r = rs % 16, math.floor(rs / 16)
+					if s == 0 then
+						if r < 15 then eobrun = receive(r) + 2 ^ r - 1; break end
+						k += 16
+					else
+						k += r
+						if k > 63 then break end
+						set(c, off + ZZ[k + 1], extend(s) * 2 ^ al)
+						k += 1
+					end
+				end
+			end
+		else
+			decode = function(c, off)
+				local k, r = ss, 0
+				while k <= se do
+					local o = off + ZZ[k + 1]
+					local cur = get(c, o)
+					local sign = cur < 0 and -1 or 1
+					local advance = true
+					if acState == 0 then
+						local rs = decodeHuff(c.ac)
+						local s = rs % 16
+						r = math.floor(rs / 16)
+						if s == 0 then
+							if r < 15 then eobrun = receive(r) + 2 ^ r; acState = 4
+							else r = 16; acState = 1 end
+						else
+							acNext = extend(s); acState = r ~= 0 and 2 or 3
+						end
+						advance = false
+					elseif acState == 1 or acState == 2 then
+						if cur ~= 0 then set(c, o, cur + sign * readBit() * 2 ^ al)
+						else
+							r -= 1
+							if r == 0 then acState = acState == 2 and 3 or 0 end
+						end
+					elseif acState == 3 then
+						if cur ~= 0 then set(c, o, cur + sign * readBit() * 2 ^ al)
+						else set(c, o, acNext * 2 ^ al); acState = 0 end
+					else
+						if cur ~= 0 then set(c, o, cur + sign * readBit() * 2 ^ al) end
+					end
+					if advance then k += 1 end
+				end
+				if acState == 4 then
+					eobrun -= 1
+					if eobrun == 0 then acState = 0 end
+				end
+			end
+		end
+
+		local f = frame
+		local single = #comps == 1
+		local expected = single and comps[1].blocksPerLine * comps[1].blocksPerColumn or f.mcusPerLine * f.mcusPerColumn
+		local mcu = 0
+		local steps = 0
+		while mcu < expected do
+			local toRead = resetInterval > 0 and math.min(expected - mcu, resetInterval) or expected
+			for _, c in ipairs(comps) do c.pred = 0 end
+			eobrun = 0; acState = 0
+			for _ = 1, toRead do
+				if single then
+					local c = comps[1]
+					local row, col = math.floor(mcu / c.blocksPerLine), mcu % c.blocksPerLine
+					decode(c, 64 * (row * c.bplMcu + col))
+				else
+					local mr, mc = math.floor(mcu / f.mcusPerLine), mcu % f.mcusPerLine
+					for _, c in ipairs(comps) do
+						for j = 0, c.v - 1 do
+							for k = 0, c.h - 1 do
+								decode(c, 64 * ((mr * c.v + j) * c.bplMcu + mc * c.h + k))
+							end
+						end
+					end
+				end
+				mcu += 1
+				steps += 1
+				if yield and steps % 4000 == 0 then yield() end
+			end
+			-- конец интервала: выровнять и пропустить маркер RSTn
+			bitsCount = 0
+			while pos + 1 < n and not (buffer.readu8(b, pos) == 0xFF and buffer.readu8(b, pos + 1) ~= 0 and buffer.readu8(b, pos + 1) ~= 0xFF) do
+				pos += 1
+			end
+			if pos + 1 < n then
+				local m = buffer.readu8(b, pos + 1)
+				if m >= 0xD0 and m <= 0xD7 then pos += 2 else break end
+			else
+				break
+			end
+		end
+	end
+
+	-- ---------- маркеры ----------
+	while pos + 4 <= n do
+		if buffer.readu8(b, pos) ~= 0xFF then pos += 1; continue end
+		local m = buffer.readu8(b, pos + 1)
+		if m == 0xFF then pos += 1; continue end
+		pos += 2
+		if m == 0xD9 then break end
+		if m == 0xD8 or (m >= 0xD0 and m <= 0xD7) or m == 0x01 then continue end
+		local len = u16(pos)
+		local p = pos + 2
+		local nextPos = pos + len
+		if nextPos > n then return nil, "JPG оборван" end
+		if m == 0xDB then                              -- таблицы квантования
+			while p < nextPos do
+				local pq, tq = math.floor(buffer.readu8(b, p) / 16), buffer.readu8(b, p) % 16
+				p += 1
+				local tbl = table.create(64, 1)
+				for k = 0, 63 do
+					local v
+					if pq == 0 then v = buffer.readu8(b, p); p += 1 else v = u16(p); p += 2 end
+					tbl[ZZ[k + 1] + 1] = v
+				end
+				qt[tq] = tbl
+			end
+		elseif m == 0xC0 or m == 0xC1 or m == 0xC2 then
+			progressive = m == 0xC2
+			frame = { h = u16(p + 1), w = u16(p + 3), comps = {}, byId = {} }
+			if frame.w == 0 or frame.h == 0 or frame.w * frame.h > 40000000 then return nil, "странный размер JPG" end
+			local nc = buffer.readu8(b, p + 5)
+			for i = 0, nc - 1 do
+				local q = p + 6 + i * 3
+				local hv = buffer.readu8(b, q + 1)
+				local c = { id = buffer.readu8(b, q), h = math.max(1, math.floor(hv / 16)), v = math.max(1, hv % 16), tq = buffer.readu8(b, q + 2) }
+				table.insert(frame.comps, c); frame.byId[c.id] = c
+			end
+			prepareFrame(frame)
+		elseif m >= 0xC3 and m <= 0xCF and m ~= 0xC4 and m ~= 0xC8 and m ~= 0xCC then
+			return nil, "такой JPG (без потерь/арифметический) не умею — пересохрани картинку"
+		elseif m == 0xC4 then                          -- таблицы Хаффмана
+			while p < nextPos do
+				local tc, th = math.floor(buffer.readu8(b, p) / 16), buffer.readu8(b, p) % 16
+				p += 1
+				local counts, total = table.create(16, 0), 0
+				for i = 1, 16 do counts[i] = buffer.readu8(b, p + i - 1); total += counts[i] end
+				p += 16
+				local syms = table.create(total, 0)
+				for i = 1, total do syms[i] = buffer.readu8(b, p + i - 1) end
+				p += total
+				local h = buildHuff(counts, syms)
+				if tc == 0 then dcT[th] = h else acT[th] = h end
+			end
+		elseif m == 0xDD then
+			resetInterval = u16(p)
+		elseif m == 0xEE and len >= 14 and buffer.readstring(b, p, 5) == "Adobe" then
+			adobe = buffer.readu8(b, p + 11)
+		elseif m == 0xE1 then
+			local o = exifOrientation(b, p, len - 2)
+			if o >= 1 and o <= 8 then orient = o end
+		elseif m == 0xDA then                          -- проход
+			if not frame then return nil, "JPG без заголовка кадра" end
+			local ns = buffer.readu8(b, p)
+			local comps = {}
+			for i = 0, ns - 1 do
+				local c = frame.byId[buffer.readu8(b, p + 1 + i * 2)]
+				if not c then return nil, "JPG: проход по неизвестному цвету" end
+				local t = buffer.readu8(b, p + 2 + i * 2)
+				c.dc = dcT[math.floor(t / 16)]; c.ac = acT[t % 16]
+				table.insert(comps, c)
+			end
+			local q = p + 1 + ns * 2
+			local ss, se, a = buffer.readu8(b, q), buffer.readu8(b, q + 1), buffer.readu8(b, q + 2)
+			pos = nextPos
+			local okScan, err = pcall(decodeScan, comps, ss, se, math.floor(a / 16), a % 16)
+			if not okScan then return nil, "JPG испорчен: " .. tostring(err) end
+			scans += 1
+			if yield then yield() end
+			continue
+		end
+		pos = nextPos
+	end
+	if not frame or scans == 0 then return nil, "в JPG нет картинки" end
+
+	-- ---------- коэффициенты -> пиксели (от 3 Мпикс — сразу 1/8 по DC, без IDCT: картинку всё равно уменьшаем) ----------
+	local f = frame
+	local small = f.w * f.h >= 3000000                    -- от 3 Мпикс: сразу 1/8 (точная средняя яркость клетки 8×8), всё равно ≥ ~250 пикс
+	local tmp = table.create(64, 0)
+	local rowsNZ = table.create(8, 0)
+	for ci, c in ipairs(f.comps) do
+		local q = qt[c.tq]
+		if not q then return nil, "JPG без таблицы квантования" end
+		local W8, H8 = c.bplMcu * 8, c.bpcMcu * 8
+		if small then
+			local plane = buffer.create(c.bplMcu * c.bpcMcu)
+			for by = 0, c.bpcMcu - 1 do
+				for bx = 0, c.bplMcu - 1 do
+					local v = buffer.readi16(c.data, 128 * (by * c.bplMcu + bx)) * q[1] / 8 + 128
+					buffer.writeu8(plane, by * c.bplMcu + bx, math.clamp(math.floor(v + 0.5), 0, 255))
+				end
+			end
+			c.plane, c.pw = plane, c.bplMcu
+		else
+			local plane = buffer.create(W8 * H8)
+			local blk = table.create(64, 0)
+			for by = 0, c.bpcMcu - 1 do
+				for bx = 0, c.bplMcu - 1 do
+					local off = 64 * (by * c.bplMcu + bx)
+					local acZero = true
+					for k = 0, 63 do
+						local v = buffer.readi16(c.data, (off + k) * 2) * q[k + 1]
+						blk[k + 1] = v
+						if k > 0 and v ~= 0 then acZero = false end
+					end
+					if acZero then
+						local v = math.clamp(math.floor(blk[1] / 8 + 128.5), 0, 255)
+						for y = 0, 7 do
+							local o = (by * 8 + y) * W8 + bx * 8
+							for x = 0, 7 do buffer.writeu8(plane, o + x, v) end
+						end
+					else
+						local nz, nnz = rowsNZ, 0              -- строки коэффициентов, где не все нули (обычно 1–3 из 8)
+						for v = 0, 7 do
+							local base = v * 8
+							local any = false
+							for u = 1, 8 do if blk[base + u] ~= 0 then any = true; break end end
+							if any then
+								nnz += 1; nz[nnz] = v
+								for x = 0, 7 do                 -- строки: по u
+									local acc = 0
+									for u = 0, 7 do
+										local c = blk[base + u + 1]
+										if c ~= 0 then acc += COS[u * 8 + x + 1] * c end
+									end
+									tmp[base + x + 1] = acc
+								end
+							end
+						end
+						for y = 0, 7 do                         -- столбцы: по v, только ненулевые строки
+							local o = (by * 8 + y) * W8 + bx * 8
+							for x = 0, 7 do
+								local acc = 0
+								for i = 1, nnz do
+									local v = nz[i]
+									acc += COS[v * 8 + y + 1] * tmp[v * 8 + x + 1]
+								end
+								buffer.writeu8(plane, o + x, math.clamp(math.floor(acc + 128.5), 0, 255))
+							end
+						end
+					end
+				end
+				if yield and by % 8 == 7 then yield() end
+			end
+			c.plane, c.pw = plane, W8
+		end
+		c.data = nil
+	end
+	local W = small and math.ceil(f.w / 8) or f.w
+	local H = small and math.ceil(f.h / 8) or f.h
+	local px = buffer.create(W * H * 4)
+	local nc = #f.comps
+	if nc == 4 then return nil, "CMYK JPG не умею — пересохрани как обычный JPG или PNG" end
+	local rgbDirect = nc == 3 and adobe == 0
+	local c1, c2, c3 = f.comps[1], f.comps[2], f.comps[3]
+	-- прореженный цвет растягивается плавно (по центрам отсчётов, как в libjpeg), полный — читается как есть
+	for _, c in ipairs(f.comps) do
+		c.rx, c.ry = c.h / f.maxH, c.v / f.maxV
+		c.ph = math.floor(buffer.len(c.plane) / c.pw)
+		c.full = c.h == f.maxH and c.v == f.maxV
+	end
+	local function s(c, x, y)
+		if c.full then return buffer.readu8(c.plane, y * c.pw + x) end
+		local fx = math.clamp((x + 0.5) * c.rx - 0.5, 0, c.pw - 1)
+		local fy = math.clamp((y + 0.5) * c.ry - 0.5, 0, c.ph - 1)
+		local x0, y0 = math.floor(fx), math.floor(fy)
+		local x1, y1 = math.min(x0 + 1, c.pw - 1), math.min(y0 + 1, c.ph - 1)
+		local ax, ay = fx - x0, fy - y0
+		local p = c.plane
+		local top = buffer.readu8(p, y0 * c.pw + x0) * (1 - ax) + buffer.readu8(p, y0 * c.pw + x1) * ax
+		local bot = buffer.readu8(p, y1 * c.pw + x0) * (1 - ax) + buffer.readu8(p, y1 * c.pw + x1) * ax
+		return top * (1 - ay) + bot * ay
+	end
+	for y = 0, H - 1 do
+		for x = 0, W - 1 do
+			local r, g, bl
+			if nc == 1 then
+				r = s(c1, x, y); g, bl = r, r
+			else
+				local Y, Cb, Cr = s(c1, x, y), s(c2, x, y), s(c3, x, y)
+				if rgbDirect then r, g, bl = Y, Cb, Cr
+				else
+					r = Y + 1.402 * (Cr - 128)
+					g = Y - 0.344136 * (Cb - 128) - 0.714136 * (Cr - 128)
+					bl = Y + 1.772 * (Cb - 128)
+				end
+			end
+			local o = (y * W + x) * 4
+			buffer.writeu8(px, o, math.clamp(math.floor(r + 0.5), 0, 255))
+			buffer.writeu8(px, o + 1, math.clamp(math.floor(g + 0.5), 0, 255))
+			buffer.writeu8(px, o + 2, math.clamp(math.floor(bl + 0.5), 0, 255))
+			buffer.writeu8(px, o + 3, 255)
+		end
+		if yield and y % 64 == 63 then yield() end
+	end
+	-- поворот по EXIF (телефонные фото)
+	if orient ~= 1 then
+		local swap = orient >= 5
+		local W2, H2 = swap and H or W, swap and W or H
+		local out = buffer.create(W2 * H2 * 4)
+		for y = 0, H2 - 1 do
+			for x = 0, W2 - 1 do
+				local sx, sy
+				if orient == 2 then sx, sy = W - 1 - x, y
+				elseif orient == 3 then sx, sy = W - 1 - x, H - 1 - y
+				elseif orient == 4 then sx, sy = x, H - 1 - y
+				elseif orient == 5 then sx, sy = y, x
+				elseif orient == 6 then sx, sy = y, H - 1 - x
+				elseif orient == 7 then sx, sy = W - 1 - y, H - 1 - x
+				else sx, sy = W - 1 - y, x end
+				buffer.copy(out, (y * W2 + x) * 4, px, (sy * W + sx) * 4, 4)
+			end
+		end
+		px, W, H = out, W2, H2
+	end
+	return { w = W, h = H, px = px, small = small }
+end
+end)()
+
 function Img.decode(bytes, yield)
 	local b = buffer.fromstring(bytes)
 	local n = buffer.len(b)
 	if n >= 8 and buffer.readstring(b, 0, 8) == "\137PNG\r\n\26\n" then return decodePNG(b, yield) end
 	if n >= 2 and buffer.readstring(b, 0, 2) == "BM" then return decodeBMP(b) end
-	if n >= 3 and buffer.readu8(b, 0) == 255 and buffer.readu8(b, 1) == 216 then return nil, "JPG пока не умею — сохрани картинку как PNG" end
+	if n >= 3 and buffer.readu8(b, 0) == 255 and buffer.readu8(b, 1) == 216 then return decodeJPEG(b, yield) end
 	if n >= 12 and buffer.readstring(b, 0, 4) == "RIFF" and buffer.readstring(b, 8, 4) == "WEBP" then
 		return nil, "WEBP не умею — сохрани картинку как PNG"
 	end
 	if n >= 5 and buffer.readstring(b, 0, 5):lower():find("<") then return nil, "это не картинка (похоже на страницу сайта)" end
-	return nil, "не PNG и не BMP"
+	return nil, "не PNG, JPG и не BMP"
 end
 
 -- ---------- уменьшение / увеличение: среднее по клетке ----------
@@ -1842,16 +2324,16 @@ local imgChips = new("ScrollingFrame", { BackgroundTransparency = 1, BorderSizeP
 	ScrollBarThickness = 0, ScrollingDirection = Enum.ScrollingDirection.X, AutomaticCanvasSize = Enum.AutomaticSize.X,
 	CanvasSize = UDim2.new(), Parent = imgScroll },
 	{ new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), VerticalAlignment = Enum.VerticalAlignment.Center }) })
-local urlBox = field(imgScroll, 46, "", "или ссылка на .png")
+local urlBox = field(imgScroll, 46, "", "или ссылка на картинку")
 urlBox.Size = UDim2.new(1, IW - 56, 0, 28)
 local urlBtn = smallBtn(imgScroll, "Взять", 0, 48, 50, 24)
 urlBtn.Position = UDim2.new(1, IW - 50, 0, 48)
-tip(urlBtn, "Скачать картинку по ссылке (PNG или BMP; JPG не подойдёт)")
+tip(urlBtn, "Скачать картинку по ссылке: PNG, JPG или BMP")
 local pvBox = new("Frame", { BackgroundColor3 = Color3.fromRGB(14, 14, 18), Position = UDim2.fromOffset(0, 82), Size = UDim2.new(1, IW, 0, 188),
 	ClipsDescendants = true, Parent = imgScroll }, { corner(8) })
 local pvCanvas = new("Frame", { BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
 	Size = UDim2.fromOffset(0, 0), Parent = pvBox })
-local pvEmpty = label("Положи .png в папку\nworkspace/" .. IMG_DIR .. "\nили вставь ссылку выше", 11, C.muted, false,
+local pvEmpty = label("Положи картинку (png, jpg, bmp)\nв папку workspace/" .. IMG_DIR .. "\n— она откроется сама.\nИли вставь ссылку выше.", 11, C.muted, false,
 	{ Size = UDim2.fromScale(1, 1), TextWrapped = true, TextTruncate = Enum.TextTruncate.None, TextXAlignment = Enum.TextXAlignment.Center, Parent = pvBox })
 local imgInfo = label("", 11, C.muted, false, { Position = UDim2.fromOffset(0, 274), Size = UDim2.new(1, IW, 0, 14),
 	TextXAlignment = Enum.TextXAlignment.Center, Parent = imgScroll })
@@ -1909,9 +2391,21 @@ rowLabel("Склеивать", Y0 + 192, "Соседние пиксели одн
 local mergeSw = switch(imgScroll, UDim2.fromOffset(72, Y0 + 194), function(on) IS.merge = on; saveSettings(); imgRegen() end)
 label("одинаковые — одной плитой", 10, C.faint, false, { Position = UDim2.fromOffset(116, Y0 + 192), Size = UDim2.new(1, -116 + IW, 0, 26),
 	TextWrapped = true, TextTruncate = Enum.TextTruncate.None, Parent = imgScroll })
-local imgSave = smallBtn(imgScroll, "Сохранить как .Build", 0, Y0 + 232, 100, 30)
-imgSave.Size = UDim2.new(1, IW, 0, 30)
-tip(imgSave, "Записать картинку файлом постройки — потом её можно строить из вкладки «Файлы»")
+-- внизу: «Построить» сразу (без файла) и «В файл»
+local imgBuildHolder = new("Frame", { BackgroundColor3 = WHITE, Position = UDim2.fromOffset(0, Y0 + 232), Size = UDim2.new(1, IW - 84, 0, 32),
+	Parent = imgScroll }, { corner(9) })
+accentGradient(imgBuildHolder, 0)
+local imgBuild = new("TextButton", { Text = "Построить", TextSize = 13, Font = FONT_H, TextColor3 = WHITE, BackgroundTransparency = 1,
+	AutoButtonColor = false, Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = imgBuildHolder })
+do
+	local sc = new("UIScale", { Parent = imgBuildHolder })
+	imgBuild.MouseButton1Down:Connect(function() tween(sc, { Scale = 0.96 }, 0.08) end)
+	imgBuild.MouseButton1Up:Connect(function() tween(sc, { Scale = 1 }, 0.3, Enum.EasingStyle.Back) end)
+end
+tip(imgBuild, "Сразу построить картинку на участке — без сохранения файла. Где встанет — видно призраком (включи «Превью»).")
+local imgSave = smallBtn(imgScroll, "В файл", 0, Y0 + 233, 78, 30)
+imgSave.Position = UDim2.new(1, IW - 78, 0, Y0 + 233)
+tip(imgSave, "Сохранить картинку файлом .Build — потом её можно строить из вкладки «Файлы»")
 
 local function refreshFields()
 	resW.Text = tostring(IS.w)
@@ -2085,6 +2579,12 @@ local function openImage(name, getBytes)
 	end)
 end
 local imgChipBtns = {}
+local function markChip(name)
+	for nm, c in pairs(imgChipBtns) do
+		tween(c.s, { Color = nm == name and accent() or C.stroke, Transparency = nm == name and 0 or 0.6 }, 0.2)
+		tween(c.b, { TextColor3 = nm == name and C.text or C.muted }, 0.2)
+	end
+end
 local function imgRefreshList()
 	if makefolder and isfolder and not isfolder(IMG_DIR) then pcall(makefolder, IMG_DIR) end
 	for _, c in ipairs(imgChips:GetChildren()) do if c:IsA("GuiObject") then c:Destroy() end end
@@ -2103,10 +2603,7 @@ local function imgRefreshList()
 				local st = stroke(C.stroke, 1, 0.6); st.Parent = chip
 				interactive(chip, C.row)
 				chip.MouseButton1Click:Connect(function()
-					for nm, c in pairs(imgChipBtns) do
-						tween(c.s, { Color = nm == name and accent() or C.stroke, Transparency = nm == name and 0 or 0.6 }, 0.2)
-						tween(c.b, { TextColor3 = nm == name and C.text or C.muted }, 0.2)
-					end
+					markChip(name)
 					openImage(name, function() return readfile(p) end)
 				end)
 				imgChipBtns[name] = { b = chip, s = st }
@@ -2116,9 +2613,54 @@ local function imgRefreshList()
 	if n == 0 then
 		label("в папке пусто", 11, C.faint, false, { AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 22), Parent = imgChips })
 	end
+	if imgCur and imgChipBtns[imgCur.name] then markChip(imgCur.name) end
 	fillKinds()
 	refreshFields()
 end
+-- папку картинок смотрим раз в 2 с, пока открыта вкладка: новый файл (положили с ПК) открывается сам
+local function imgNames()
+	local ok, list = pcall(listfiles, IMG_DIR)
+	local out = {}
+	if ok and type(list) == "table" then
+		for _, p in ipairs(list) do
+			local name = p:match("([^/\\]+)$") or p
+			local low = name:lower()
+			if low:match("%.png$") or low:match("%.bmp$") or low:match("%.jpe?g$") then out[name] = p end
+		end
+	end
+	return out
+end
+task.spawn(function()
+	local known = imgNames()
+	while gui.Parent do
+		task.wait(2)
+		if pageImage.Visible and left.Visible then
+			local now = imgNames()
+			local fresh
+			for name, p in pairs(now) do if not known[name] and not fresh then fresh = { name = name, p = p } end end
+			local changed = fresh ~= nil
+			for name in pairs(known) do if not now[name] then changed = true end end
+			known = now
+			if changed then imgRefreshList() end
+			if fresh and not Engine.running then
+				say("Новая картинка: " .. fresh.name, C.ok)
+				markChip(fresh.name)
+				openImage(fresh.name, function() return readfile(fresh.p) end)
+			end
+		end
+	end
+end)
+imgBuild.MouseButton1Click:Connect(function()
+	if Engine.running then say("Уже строю — дождись конца или нажми «Стоп».", C.warn); return end
+	if not (imgCur and imgCur.info) then say("Сначала выбери картинку.", C.warn); return end
+	if currentInfo ~= imgCur.info then                         -- после картинки выбирали файл — вернуть картинку
+		selectedPath, selectedName = nil, "img_" .. imgCur.name:gsub("%.%w+$", "")
+		markSelected()
+		setTitle("Картинка: " .. imgCur.name)
+		showInfo(imgCur.info, nil, true)
+	end
+	Engine.start()
+end)
 urlBtn.MouseButton1Click:Connect(function()
 	local url = urlBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
 	if not url:match("^https?://") then imgInfo.Text = "нужна ссылка вида https://…"; imgInfo.TextColor3 = C.warn; return end
@@ -2258,7 +2800,7 @@ local function buildEngine()                                 -- своя фун�
 local MODE_CFG = {
 	{ name = "эконом", conc = 1, gap = 0.15 },
 	{ name = "базовый", conc = 8, gap = 0 },
-	{ name = "турбо", conc = 16, gap = 0, adaptive = true, min = 4, max = 128 },
+	{ name = "турбо", conc = 48, gap = 0, adaptive = true, min = 4, max = 256 },
 }
 local CALL_TIMEOUT = 20                                      -- нет ответа дольше — слот свободен, задача неудачна
 local TOL = 0.06
@@ -2301,7 +2843,7 @@ end
 -- нет — возвращаемся и пробуем снова позже (через 2, 4, 8, 16 замеров). Вниз — только при ошибках и тайм-аутах.
 local function tune(ctl, limit, done, now, tag, cfg)
 	local dt, n = now - ctl.t0, done - ctl.n0
-	if dt < math.max(1.5, 2 * ctl.rtt) or (n < 20 and dt < 6) then return limit end   -- мало данных
+	if dt < math.max(1.0, 2 * ctl.rtt) or (n < 20 and dt < 6) then return limit end   -- мало данных
 	local rate = n / dt
 	ctl.t0, ctl.n0 = now, done
 	local old = limit
@@ -2314,13 +2856,14 @@ local function tune(ctl, limit, done, now, tag, cfg)
 			ctl.best, ctl.bestRate, ctl.rejects = limit, rate, 0
 		else
 			limit = ctl.best
+			ctl.ramp = false                                 -- первая неудачная проба: разгон кончился
 			ctl.rejects = math.min(ctl.rejects + 1, 4)
 			ctl.cool = 2 ^ ctl.rejects
 		end
 	else
 		ctl.bestRate = ctl.bestRate and (ctl.bestRate + rate) / 2 or rate
 		if ctl.cool > 0 then ctl.cool -= 1
-		elseif limit < cfg.max then limit = math.min(cfg.max, math.ceil(limit * 1.25)) end
+		elseif limit < cfg.max then limit = math.min(cfg.max, math.ceil(limit * (ctl.ramp and 1.5 or 1.25))) end
 	end
 	if limit ~= old then
 		Log.w("LIMIT %s: %d -> %d (скорость %.1f/с, лучшая %.1f/с при %d)", tag, old, limit, rate, ctl.bestRate or 0, ctl.best)
@@ -2335,10 +2878,14 @@ end
 local function runPool(tag, tasks, worker, onProgress)
 	local cfg = MODE_CFG[settings.mode] or MODE_CFG[2]
 	local limit, inflight, started, done, failed = cfg.conc, 0, 0, 0, 0
+	if cfg.adaptive and type(settings.turbo) == "table" and tonumber(settings.turbo[tag]) then
+		limit = math.clamp(math.floor(settings.turbo[tag]), 16, 160)          -- с чего кончили в прошлый раз
+	end
 	local running, lastProg = {}, 0
-	local ctl = cfg.adaptive and { best = limit, bestRate = nil, t0 = os.clock(), n0 = 0, errs = 0, cool = 0, rejects = 0, rtt = 0.1 }
+	local ctl = cfg.adaptive and { best = limit, bestRate = nil, t0 = os.clock(), n0 = 0, errs = 0, cool = 0, rejects = 0, rtt = 0.1,
+		ramp = true }
 	Stat.limit = limit
-	Log.w("POOL %s: задач %d, режим %s, разом %d", tag, #tasks, cfg.name, cfg.conc)
+	Log.w("POOL %s: задач %d, режим %s, разом %d", tag, #tasks, cfg.name, limit)
 	local function close(rec, ok, res)
 		running[rec] = nil
 		local rtt = os.clock() - rec.t0
@@ -2384,6 +2931,11 @@ local function runPool(tag, tasks, worker, onProgress)
 	local t0 = os.clock()
 	while inflight > 0 and os.clock() - t0 < CALL_TIMEOUT do task.wait() end
 	Log.w("POOL %s: готово %d, отказов %d", tag, done, failed)
+	if ctl and done >= 200 and failed < done * 0.05 then        -- запомнить лучшее число запросов разом
+		if type(settings.turbo) ~= "table" then settings.turbo = {} end
+		settings.turbo[tag] = math.clamp(ctl.best, 16, 160)
+		saveSettings()
+	end
 	return done, failed
 end
 
@@ -2507,6 +3059,9 @@ local function placeOrder(list)
 	return list
 end
 
+-- турбо: пока ставятся блоки, их же растягивают и красят (инструменты не в руках). Сначала проба на нескольких
+-- блоках: сервер не принял (размер/цвет не поменялись) — выключается, и этапы идут по очереди, как раньше.
+local eagerStart, eagerStop
 local function stagePlace(job)
 	local root = rootFolder()
 	if not root then return false, "нет папки блоков на площадке" end
@@ -2532,6 +3087,7 @@ local function stagePlace(job)
 	setBar(1, (total - #todo) / math.max(1, total))
 	local tool = (#todo > 0) and equip("BuildingTool") or nil
 	if #todo > 0 and not tool then conn:Disconnect(); return false, "нет инструмента BuildingTool" end
+	local eager = #todo >= 50 and eagerStart(job) or nil
 	local confirmed = function()
 		local n = 0
 		for _, j in ipairs(job.items) do if j.model then n += 1 end end
@@ -2586,6 +3142,7 @@ local function stagePlace(job)
 	for kind, c in pairs(cost) do
 		if c.n > 0 then Log.w("COST %s итог: %d блоков, в среднем %.0f мс", kind, c.n, c.sum / c.n * 1000) end
 	end
+	eagerStop(eager)
 	conn:Disconnect()
 	Log.w("STAGE блоки: не встало %d", #todo)
 	return #todo == 0, #todo
@@ -2664,11 +3221,16 @@ local function stagePaint(job)
 		stageT0 = os.clock()
 		statReset("краска")
 		Stat.limit = 1
-		local batches = chunks(todo, 100)
 		local before, painted = #todo, 0
-		Log.w("ROUND краска %d: блоков %d, пачек %d, по одной", round, #todo, #batches)
-		for i, list in ipairs(batches) do
+		local turbo = settings.mode == 3
+		local pb = turbo and math.clamp(tonumber(settings.paintBatch) or 400, 100, 2000) or 100
+		Log.w("ROUND краска %d: блоков %d, пачка %d, по одной", round, #todo, pb)
+		local at = 1
+		while at <= #todo do
 			if not waitRun() then break end
+			local list = {}
+			for k = at, math.min(#todo, at + pb - 1) do table.insert(list, todo[k]) end
+			at += #list
 			local pairsList = {}
 			for _, j in ipairs(list) do table.insert(pairsList, { j.model, itemColor(j.it) }) end
 			local t0 = os.clock()
@@ -2682,9 +3244,14 @@ local function stagePaint(job)
 			if not ok then Stat.fail += 1 end
 			Log.w("SEND paint пачка %d: ответ %.3f с, сразу покрашено %d%s", #list, rtt, seen, ok and "" or (" · " .. tostring(err)))
 			setBar(3, (total - before + painted) / total)
-			progressText("Краска (по одной пачке)", i, #batches, Stat.fail, 1)
+			if turbo then                                    -- быстро и всё легло — пачку больше; легло не всё — меньше
+				if ok and seen >= #list * 0.98 and rtt < 1.0 then pb = math.min(2000, math.floor(pb * 1.6))
+				elseif seen < #list * 0.8 then pb = math.max(100, math.floor(pb / 2)) end
+			end
+			progressText("Краска (пачка " .. pb .. ")", at - 1, #todo, Stat.fail, 1)
 			if gap > 0 then task.wait(gap) end
 		end
+		if turbo then settings.paintBatch = math.clamp(pb, 100, 1500); saveSettings() end
 		settle(function()
 			local n = 0
 			for _, j in ipairs(todo) do if needPaint(j) then n += 1 end end
@@ -2704,6 +3271,106 @@ local function stagePaint(job)
 	end
 	Log.w("STAGE краска: осталось %d", #todo)
 	return #todo == 0, #todo
+end
+
+-- внахлёст: размеры — до 32 запросов разом, краска — по одной пачке (растёт до 1500), пока идут блоки
+function eagerStart(job)
+	if settings.mode ~= 3 or settings.eager == false then return nil end
+	local function find(name) return lp.Backpack:FindFirstChild(name) or (lp.Character and lp.Character:FindFirstChild(name)) end
+	local sTool, pTool = find("ScalingTool"), find("PaintingTool")
+	local E = { on = true, inflight = 0, painting = false, scaled = 0, painted = 0,
+		sMode = sTool and "проба" or "нет", pMode = pTool and "проба" or "нет" }
+	local items = job.items
+	local queued, cursor = {}, 1
+	local qS, hS, qP, hP = {}, 1, {}, 1
+	task.spawn(function()                                    -- новые поставленные -> очереди
+		while E.on do
+			local prefix = true
+			for i = cursor, math.min(#items, cursor + 4000) do
+				local j = items[i]
+				if j.model and not queued[j] then
+					queued[j] = true
+					if E.sMode ~= "нет" and needScale(j) then table.insert(qS, j) end
+					if E.pMode ~= "нет" and needPaint(j) then table.insert(qP, j) end
+				end
+				if prefix and (queued[j] or j.err) then cursor = i + 1 else prefix = false end
+			end
+			task.wait(0.15)
+		end
+	end)
+	task.spawn(function()                                    -- размеры
+		local probe = {}
+		while E.on and E.sMode ~= "нет" do
+			local cap = E.sMode == "проба" and 6 or 32
+			while E.inflight < cap and hS <= #qS and (E.sMode ~= "проба" or #probe < 6) do
+				local j = qS[hS]; hS += 1
+				if E.sMode == "проба" then table.insert(probe, j) end
+				E.inflight += 1
+				task.spawn(function()
+					pcall(function() sTool.RF:InvokeServer(j.model, itemSize(j.it), j.wcf) end)
+					E.inflight -= 1; E.scaled += 1
+				end)
+			end
+			if E.sMode == "проба" and #probe >= 6 and E.inflight == 0 then
+				local t0, ok = os.clock(), 0
+				repeat
+					ok = 0
+					for _, j in ipairs(probe) do if not needScale(j) then ok += 1 end end
+					if ok < 5 then task.wait(0.1) end
+				until ok >= 5 or os.clock() - t0 > 1.5
+				E.sMode = ok >= 5 and "вкл" or "нет"
+				Log.w("EAGER размеры: проба %d из %d — %s", ok, #probe, E.sMode == "вкл" and "растягиваю сразу" or "сервер не принял, после блоков")
+			end
+			task.wait()
+		end
+	end)
+	task.spawn(function()                                    -- краска
+		local batch = 30
+		while E.on and E.pMode ~= "нет" do
+			local ready = #qP - hP + 1
+			if ready >= batch or (ready > 0 and E.pMode == "вкл" and ready >= 50) then
+				local list, pl = {}, {}
+				for _ = 1, math.min(ready, batch) do
+					local j = qP[hP]; hP += 1
+					table.insert(list, j); table.insert(pl, { j.model, itemColor(j.it) })
+				end
+				E.painting = true
+				local t0 = os.clock()
+				local ok = invokeWait(CALL_TIMEOUT, function() return pTool.RF:InvokeServer(pl) end)
+				local rtt = os.clock() - t0
+				local seen = 0
+				for _, j in ipairs(list) do if not needPaint(j) then seen += 1 end end
+				if E.pMode == "проба" then
+					local w0 = os.clock()
+					while seen < #list * 0.8 and os.clock() - w0 < 1.5 do
+						task.wait(0.1)
+						seen = 0
+						for _, j in ipairs(list) do if not needPaint(j) then seen += 1 end end
+					end
+					E.pMode = seen >= #list * 0.8 and "вкл" or "нет"
+					Log.w("EAGER краска: проба %d из %d — %s", seen, #list, E.pMode == "вкл" and "крашу сразу" or "сервер не принял, после блоков")
+					batch = 200
+				elseif ok and seen >= #list * 0.98 and rtt < 1.0 then
+					batch = math.min(1500, math.floor(batch * 1.6))
+				elseif seen < #list * 0.8 then
+					batch = math.max(100, math.floor(batch / 2))
+				end
+				E.painted += seen
+				E.painting = false
+			else
+				task.wait(0.1)
+			end
+		end
+	end)
+	Log.w("EAGER старт: размеры — %s, краска — %s", E.sMode, E.pMode)
+	return E
+end
+function eagerStop(E)
+	if not E then return end
+	E.on = false
+	local t0 = os.clock()
+	while (E.inflight > 0 or E.painting) and os.clock() - t0 < CALL_TIMEOUT do task.wait(0.05) end
+	Log.w("EAGER итог: растянуто %d (%s), покрашено %d (%s)", E.scaled, E.sMode, E.painted, E.pMode)
 end
 
 -- 4. настройки: числа — текстом (в единицах окна настроек), галочки — переключением, нота — шагами по полутону
