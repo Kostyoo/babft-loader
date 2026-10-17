@@ -42,9 +42,11 @@ BABFT_Loader/logs/.
 сразу, без файла; папка картинок проверяется раз в 2 с: новый файл с ПК открывается сам.
 0.17: турбо быстрее: старт с лучшего числа запросов прошлой стройки (или 48), разгон ×1.5 в секунду, потолок 256;
 краска пачками до 2000 (растут, пока сервер успевает); пока ставятся блоки — их же растягивают и красят (после пробы).
+0.18: мелкие плитки (пиксель меньше 1) ставятся в ячейки перед картинкой и растяжкой сразу переносятся на место —
+большой блок не накрывает сотни соседей; турбо снижает число запросов, если ответ сервера вырос в разы (старт не выше 96).
 ]]
 
-local VERSION = "0.17"
+local VERSION = "0.18"
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
@@ -2847,6 +2849,15 @@ local function tune(ctl, limit, done, now, tag, cfg)
 	local rate = n / dt
 	ctl.t0, ctl.n0 = now, done
 	local old = limit
+	if n >= 20 then ctl.minRtt = math.min(ctl.minRtt or math.huge, ctl.rtt) end
+	if ctl.errs == 0 and ctl.minRtt and ctl.rtt > math.max(1.5, 6 * ctl.minRtt) and limit > cfg.min then
+		-- сервер захлёбывается (журнал 17.10, пиксель 0.1: 240 разом -> ответ 20 с и 8 блоков/с): меньше запросов разом
+		limit = math.max(cfg.min, math.floor(limit * 0.6))
+		ctl.best, ctl.bestRate, ctl.ramp, ctl.cool = limit, nil, false, 3
+		Log.w("LIMIT %s: %d -> %d (перегруз: ответ %.2f с, обычно %.2f с)", tag, old, limit, ctl.rtt, ctl.minRtt)
+		Stat.limit = limit
+		return limit
+	end
 	if ctl.errs > 0 then
 		ctl.errs = 0
 		limit = math.max(cfg.min, math.floor(limit / 2))
@@ -2879,7 +2890,7 @@ local function runPool(tag, tasks, worker, onProgress)
 	local cfg = MODE_CFG[settings.mode] or MODE_CFG[2]
 	local limit, inflight, started, done, failed = cfg.conc, 0, 0, 0, 0
 	if cfg.adaptive and type(settings.turbo) == "table" and tonumber(settings.turbo[tag]) then
-		limit = math.clamp(math.floor(settings.turbo[tag]), 16, 160)          -- с чего кончили в прошлый раз
+		limit = math.clamp(math.floor(settings.turbo[tag]), 16, 96)           -- с чего кончили в прошлый раз (не выше 96)
 	end
 	local running, lastProg = {}, 0
 	local ctl = cfg.adaptive and { best = limit, bestRate = nil, t0 = os.clock(), n0 = 0, errs = 0, cool = 0, rejects = 0, rtt = 0.1,
@@ -2933,7 +2944,7 @@ local function runPool(tag, tasks, worker, onProgress)
 	Log.w("POOL %s: готово %d, отказов %d", tag, done, failed)
 	if ctl and done >= 200 and failed < done * 0.05 then        -- запомнить лучшее число запросов разом
 		if type(settings.turbo) ~= "table" then settings.turbo = {} end
-		settings.turbo[tag] = math.clamp(ctl.best, 16, 160)
+		settings.turbo[tag] = math.clamp(ctl.best, 16, 96)
 		saveSettings()
 	end
 	return done, failed
@@ -2965,7 +2976,8 @@ function Index.find(name, pos, owner)                        -- первый н�
 	end)
 end
 function Index.wait(j)                                       -- ждать подтверждения этого блока
-	local k = ckey(j.kind, cell(j.wpos.X), cell(j.wpos.Y), cell(j.wpos.Z))
+	local wp = j.ppos or j.wpos
+	local k = ckey(j.kind, cell(wp.X), cell(wp.Y), cell(wp.Z))
 	Index.pending[k] = Index.pending[k] or {}
 	table.insert(Index.pending[k], j)
 end
@@ -2981,7 +2993,7 @@ function Index.add(m)
 		local list = Index.pending[pk]
 		if not list then return nil end
 		for i, j in ipairs(list) do
-			if not j.model and (j.wpos - p).Magnitude <= TOL * 1.8 then
+			if not j.model and ((j.ppos or j.wpos) - p).Magnitude <= TOL * 1.8 then
 				j.model = m
 				Index.claimed[m] = j
 				table.remove(list, i)
@@ -3062,6 +3074,201 @@ end
 -- турбо: пока ставятся блоки, их же растягивают и красят (инструменты не в руках). Сначала проба на нескольких
 -- блоках: сервер не принял (размер/цвет не поменялись) — выключается, и этапы идут по очереди, как раньше.
 local eagerStart, eagerStop
+
+-- Мелкие плитки (журнал 17.10, картинка с пикселем 0.1, 14 854 блока): блок ставится размером 2×2×2 и накрывает
+-- сотни соседей — ответ сервера вырос до 20 с, 8 блоков в секунду. Поэтому такой блок ставится в свободную ячейку
+-- перед картинкой (сетка через 2.25 стада: большие блоки не касаются ни картинки, ни друг друга), растяжка сразу
+-- уменьшает его и переносит на место, и ячейка достаётся следующему. Сначала проба на 3 ячейках (ближней, средней,
+-- дальней): перенос не принят — пробные удаляются, стройка идёт по-старому.
+local Staged = { on = false, slots = {}, free = {}, reapT = 0 }
+function Staged.small(job)                                   -- больше половины — тонкие плитки (две стороны меньше 1)
+	local small, n = 0, 0
+	for _, j in ipairs(job.items) do
+		if RESIZABLE[j.kind] then
+			n += 1
+			local s3 = itemSize(j.it)
+			local a = { s3.X, s3.Y, s3.Z }
+			table.sort(a)
+			if a[2] < 1 then small += 1 end
+		end
+	end
+	return n >= 100 and small >= n * 0.5
+end
+function Staged.setup(job, count)
+	local ref, c, cnt = nil, Vector3.new(0, 0, 0), 0
+	for _, j in ipairs(job.items) do
+		if RESIZABLE[j.kind] then ref = ref or j; c += j.wpos; cnt += 1 end
+	end
+	c /= cnt
+	local ax = { ref.wcf:VectorToWorldSpace(Vector3.new(1, 0, 0)), ref.wcf:VectorToWorldSpace(Vector3.new(0, 1, 0)),
+		ref.wcf:VectorToWorldSpace(Vector3.new(0, 0, 1)) }
+	local lo, hi = { 0, 0, 0 }, { 0, 0, 0 }                  -- нормаль — ось, вдоль которой плитки не расходятся
+	for _, j in ipairs(job.items) do                         -- (по толщине плитки нельзя: при пикселе 0.1 она толще)
+		if RESIZABLE[j.kind] then
+			local d = j.wpos - c
+			for i = 1, 3 do local x = d:Dot(ax[i]); lo[i], hi[i] = math.min(lo[i], x), math.max(hi[i], x) end
+		end
+	end
+	local k = 1
+	for i = 2, 3 do if hi[i] - lo[i] < hi[k] - lo[k] then k = i end end
+	local nrm, u, v = ax[k], ax[k % 3 + 1], ax[(k + 1) % 3 + 1]
+	if nrm.Y < -0.7 then nrm = -nrm end                       -- картинка на полу: ячейки — над ней, не под землёй
+	if math.abs(u.Y) > math.abs(v.Y) then u, v = v, u end     -- u — вдоль земли: туда сетку можно расширять
+	local front, ulo, uhi, vlo, vhi = 0, 0, 0, 0, 0
+	for _, j in ipairs(job.items) do
+		local d = j.wpos - c
+		local s3 = itemSize(j.it)
+		local half = RESIZABLE[j.kind] and ({ s3.X, s3.Y, s3.Z })[k] / 2 or math.max(s3.X, s3.Y, s3.Z) / 2
+		front = math.max(front, d:Dot(nrm) + half)               -- самая выступающая точка картинки
+		ulo, uhi = math.min(ulo, d:Dot(u)), math.max(uhi, d:Dot(u))
+		vlo, vhi = math.min(vlo, d:Dot(v)), math.max(vhi, d:Dot(v))
+	end
+	local STEP = 2.25
+	local nv = math.floor((vhi - vlo) / STEP) + 1              -- ряды — в пределах картинки
+	local maxU = math.max(math.floor((uhi - ulo) / STEP) + 1, 16)
+	local layers = math.clamp(math.ceil(count / (nv * maxU)), 1, 4)
+	local nu = math.min(maxU, math.ceil(count / (nv * layers)))
+	local rot = ref.wcf.Rotation
+	local cu, cv = (ulo + uhi) / 2, (vlo + vhi) / 2
+	Staged.slots, Staged.free = {}, {}
+	for l = 0, layers - 1 do
+		for r = 0, nv - 1 do
+			for q = 0, nu - 1 do
+				local pos = c + nrm * (front + 1.2 + l * STEP) + u * (cu + (q - (nu - 1) / 2) * STEP) + v * (cv + (r - (nv - 1) / 2) * STEP)
+				table.insert(Staged.slots, { cf = CFrame.new(pos) * rot, pos = pos })
+			end
+		end
+	end
+	for i = #Staged.slots, 1, -1 do table.insert(Staged.free, Staged.slots[i]) end
+	Log.w("STAGED ячеек %d (%d × %d × %d слоя), перед картинкой на %.2f", #Staged.slots, nu, nv, layers, front + 1.2)
+	return #Staged.slots >= 3
+end
+function Staged.acquire(j)                                   -- ячейка для блока j; false — ставить сразу на место
+	if j.slot then j.slot.dead, j.slot.j, j.slot = true, nil, nil end   -- повтор: старую ячейку больше не трогать
+	local t0 = os.clock()
+	while Staged.on and not Engine.stopFlag do
+		local s = table.remove(Staged.free)
+		if s then
+			s.j, j.slot, j.pcf, j.ppos = j, s, s.cf, s.pos
+			return true
+		end
+		local now = os.clock()
+		if now - Staged.reapT > 0.5 then                       -- ответ был, а блока нет 6 с: ячейка, видно, вне зоны
+			Staged.reapT = now
+			local alive = 0
+			for _, q in ipairs(Staged.slots) do
+				local o = q.j
+				if o and not o.model and o.respAt and now - o.respAt > 6 then
+					q.dead, q.j, o.slot = true, nil, nil
+					Log.w("STAGED ячейка снята: блок #%s не появился", tostring(o.it.id))
+				end
+				if not q.dead then alive += 1 end
+			end
+			if alive == 0 then Staged.on = false; Log.w("STAGED выкл: ячеек не осталось") end
+		end
+		if now - t0 > 10 then break end
+		task.wait(0.03)
+	end
+	j.pcf, j.ppos = nil, nil
+	return false
+end
+function Staged.release(j)                                   -- блок перенесён: ячейка свободна
+	local s = j.slot
+	if s and s.j == j then
+		s.j, j.slot = nil, nil
+		if not s.dead then table.insert(Staged.free, s) end
+	end
+end
+function Staged.moved(j)
+	local pp = j.model and j.model.Parent and j.model:FindFirstChild("PPart")
+	return pp ~= nil and (pp.Size - itemSize(j.it)).Magnitude <= 0.01 and (pp.Position - j.wpos).Magnitude <= 0.03
+end
+-- блоки, оставшиеся в ячейках (опоздали или с прерванной стройки): к ещё не поставленным (adopt); в конце лишние — удалить
+function Staged.sweep(job, final, adopt)
+	local kinds, wait, extra, got = {}, {}, {}, 0
+	for _, j in ipairs(job.items) do
+		if RESIZABLE[j.kind] then
+			kinds[j.kind] = true
+			if adopt and not j.model and not j.err then wait[j.kind] = wait[j.kind] or {}; table.insert(wait[j.kind], j) end
+		end
+	end
+	for _, s in ipairs(Staged.slots) do
+		for kind in pairs(kinds) do
+			near(kind, s.pos, function(key)
+				for _, m in ipairs(Index.cells[key] or {}) do
+					local pp = m.Parent and m:FindFirstChild("PPart")
+					if pp and not Index.claimed[m] and (pp.Position - s.pos).Magnitude <= TOL * 1.8
+						and (pp.Size - Vector3.new(2, 2, 2)).Magnitude < 0.05 then
+						local j = wait[kind] and table.remove(wait[kind])
+						if j then
+							j.model, j.ppos = m, s.pos
+							Index.claimed[m] = j
+							got += 1
+						elseif final then
+							Index.claimed[m] = true
+							table.insert(extra, m)
+						end
+					end
+				end
+				return nil
+			end)
+		end
+	end
+	if got > 0 or #extra > 0 then Log.w("STAGED в ячейках: взято %d, лишних %d", got, #extra) end
+	if #extra > 0 and not Engine.stopFlag then
+		local d = equip("DeleteTool")
+		if d then for _, m in ipairs(extra) do pcall(function() d.RF:InvokeServer(m) end) end end
+	end
+	return got
+end
+function Staged.probe(job, todo, buildTool)
+	local sTool = lp.Backpack:FindFirstChild("ScalingTool") or (lp.Character and lp.Character:FindFirstChild("ScalingTool"))
+	if not sTool then return false end
+	local probe = {}
+	for _, j in ipairs(todo) do
+		if RESIZABLE[j.kind] and not j.model then table.insert(probe, j) end
+		if #probe == 3 then break end
+	end
+	if #probe < 3 then return false end
+	local pick = { Staged.slots[1], Staged.slots[math.ceil(#Staged.slots / 2)], Staged.slots[#Staged.slots] }
+	for i, j in ipairs(probe) do
+		local s = pick[i]
+		for n, f in ipairs(Staged.free) do if f == s then table.remove(Staged.free, n); break end end
+		s.j, j.slot, j.pcf, j.ppos = j, s, s.cf, s.pos
+		local data = lp:FindFirstChild("Data") and lp.Data:FindFirstChild(j.kind)
+		Index.wait(j)
+		task.spawn(function()
+			pcall(function() buildTool.RF:InvokeServer(j.kind, data and data.Value or 1, nil, nil, true, j.pcf, false, false) end)
+		end)
+	end
+	local function count(f) local n = 0 for _, j in ipairs(probe) do if f(j) then n += 1 end end return n end
+	local function placed(j) return j.model ~= nil end
+	local t0 = os.clock()
+	while count(placed) < #probe and os.clock() - t0 < 6 do task.wait(0.05) end
+	for _, j in ipairs(probe) do
+		if j.model then task.spawn(function() pcall(function() sTool.RF:InvokeServer(j.model, itemSize(j.it), j.wcf) end) end) end
+	end
+	t0 = os.clock()
+	local good = 0
+	repeat
+		task.wait(0.1)
+		good = count(Staged.moved)
+	until good == #probe or os.clock() - t0 > 3
+	Log.w("STAGED проба: поставлено %d, перенесено %d из %d", count(placed), good, #probe)
+	for _, j in ipairs(probe) do Staged.release(j) end
+	if good == #probe then return true end
+	local bad = {}                                            -- в ячейке, но не перенёсся: убрать, ставить по-старому
+	for _, j in ipairs(probe) do
+		if not Staged.moved(j) then
+			if j.model then table.insert(bad, j.model); Index.claimed[j.model] = nil end
+			j.model, j.pcf, j.ppos = nil, nil, nil
+		end
+	end
+	local d = #bad > 0 and equip("DeleteTool")
+	if d then for _, m in ipairs(bad) do pcall(function() d.RF:InvokeServer(m) end) end end
+	if #bad > 0 then equip("BuildingTool") end
+	return false
+end
 local function stagePlace(job)
 	local root = rootFolder()
 	if not root then return false, "нет папки блоков на площадке" end
@@ -3087,7 +3294,22 @@ local function stagePlace(job)
 	setBar(1, (total - #todo) / math.max(1, total))
 	local tool = (#todo > 0) and equip("BuildingTool") or nil
 	if #todo > 0 and not tool then conn:Disconnect(); return false, "нет инструмента BuildingTool" end
-	local eager = #todo >= 50 and eagerStart(job) or nil
+	local staged = false                                     -- ячейки перед картинкой (см. Staged)
+	Staged.on, Staged.slots, Staged.free = false, {}, {}
+	if #todo >= 100 and settings.mode == 3 and settings.staged ~= false and Staged.small(job)
+		and Staged.setup(job, math.clamp(math.floor(#todo / 4), 16, 192)) then
+		Staged.on = true
+		staged = Staged.probe(job, todo, tool)
+		Staged.on = staged
+		Log.w("STAGED %s", staged and "вкл: блок ставится в ячейку перед картинкой и сразу переносится на место"
+			or "выкл: сервер не дал перенести, ставлю по-старому")
+		Staged.sweep(job, not staged, staged)                  -- с прошлой, прерванной стройки
+		local rest = {}
+		for _, j in ipairs(todo) do if not j.model then table.insert(rest, j) end end
+		todo = rest
+	end
+	local eager = #todo >= 50 and eagerStart(job, staged) or nil
+	if staged and not (eager and eager.sMode == "вкл") then staged = false; Staged.on = false end
 	local confirmed = function()
 		local n = 0
 		for _, j in ipairs(job.items) do if j.model then n += 1 end end
@@ -3110,12 +3332,14 @@ local function stagePlace(job)
 				Log.w("SKIP %s #%s: нет в инвентаре", j.kind, tostring(j.it.id))
 				return false
 			end
+			if staged and RESIZABLE[j.kind] then Staged.acquire(j) end   -- ждёт свободную ячейку
 			Index.wait(j)
 			j.sentAt = os.clock()
 			-- всегда закреплённым: незакреплённые отпускаются в конце (stageRelease), иначе падают раньше, чем
 			-- появятся соседи
-			tool.RF:InvokeServer(j.kind, data.Value, nil, nil, true, j.wcf, false, false)
+			tool.RF:InvokeServer(j.kind, data.Value, nil, nil, true, j.pcf or j.wcf, false, false)
 			local now = os.clock()
+			j.respAt = now
 			Log.w("SEND place %s #%s ответ %.3f с", j.kind, tostring(j.it.id), now - j.sentAt)
 			if lastDone and Stat.inflight > 1 then               -- очередь полна: промежуток = цена этого блока
 				local c = cost[j.kind] or { n = 0, wn = 0, wsum = 0, sum = 0 }
@@ -3134,6 +3358,7 @@ local function stagePlace(job)
 			for _, j in ipairs(sendList) do if not j.model and not j.err then n += 1 end end
 			return n
 		end, "блоки")
+		if staged then Staged.sweep(job, false, true) end       -- опоздавшие в ячейках — к неподтверждённым
 		setBar(1, confirmed() / math.max(1, total))
 		local left = {}
 		for _, j in ipairs(todo) do if not j.model then table.insert(left, j) end end
@@ -3143,6 +3368,13 @@ local function stagePlace(job)
 		if c.n > 0 then Log.w("COST %s итог: %d блоков, в среднем %.0f мс", kind, c.n, c.sum / c.n * 1000) end
 	end
 	eagerStop(eager)
+	if staged then
+		Staged.sweep(job, true, true)
+		local left = {}
+		for _, j in ipairs(todo) do if not j.model then table.insert(left, j) end end
+		todo = left
+	end
+	Staged.on = false
 	conn:Disconnect()
 	Log.w("STAGE блоки: не встало %d", #todo)
 	return #todo == 0, #todo
@@ -3151,7 +3383,8 @@ end
 -- 2. размеры (только растягиваемые)
 local function needScale(j)
 	if not RESIZABLE[j.kind] or not j.model or not j.model:FindFirstChild("PPart") then return false end
-	return (j.model.PPart.Size - itemSize(j.it)).Magnitude > 0.01
+	local pp = j.model.PPart
+	return (pp.Size - itemSize(j.it)).Magnitude > 0.01 or (j.ppos ~= nil and (pp.Position - j.wpos).Magnitude > 0.03)
 end
 local function stageScale(job)
 	local todo = {}
@@ -3274,12 +3507,12 @@ local function stagePaint(job)
 end
 
 -- внахлёст: размеры — до 32 запросов разом, краска — по одной пачке (растёт до 1500), пока идут блоки
-function eagerStart(job)
-	if settings.mode ~= 3 or settings.eager == false then return nil end
+function eagerStart(job, staged)
+	if settings.mode ~= 3 or (settings.eager == false and not staged) then return nil end
 	local function find(name) return lp.Backpack:FindFirstChild(name) or (lp.Character and lp.Character:FindFirstChild(name)) end
 	local sTool, pTool = find("ScalingTool"), find("PaintingTool")
 	local E = { on = true, inflight = 0, painting = false, scaled = 0, painted = 0,
-		sMode = sTool and "проба" or "нет", pMode = pTool and "проба" or "нет" }
+		sMode = sTool and (staged and "вкл" or "проба") or "нет", pMode = pTool and "проба" or "нет" }
 	local items = job.items
 	local queued, cursor = {}, 1
 	local qS, hS, qP, hP = {}, 1, {}, 1
@@ -3301,7 +3534,7 @@ function eagerStart(job)
 	task.spawn(function()                                    -- размеры
 		local probe = {}
 		while E.on and E.sMode ~= "нет" do
-			local cap = E.sMode == "проба" and 6 or 32
+			local cap = E.sMode == "проба" and 6 or (staged and 96 or 32)
 			while E.inflight < cap and hS <= #qS and (E.sMode ~= "проба" or #probe < 6) do
 				local j = qS[hS]; hS += 1
 				if E.sMode == "проба" then table.insert(probe, j) end
@@ -3309,6 +3542,7 @@ function eagerStart(job)
 				task.spawn(function()
 					pcall(function() sTool.RF:InvokeServer(j.model, itemSize(j.it), j.wcf) end)
 					E.inflight -= 1; E.scaled += 1
+					if j.slot then Staged.release(j) end
 				end)
 			end
 			if E.sMode == "проба" and #probe >= 6 and E.inflight == 0 then
