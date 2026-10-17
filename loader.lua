@@ -36,9 +36,11 @@ BABFT_Loader/logs/.
 0.14: «Копия» — постройка с участка (своего или чужого игрока) сохраняется в файл .Build с именем.
 0.15: слева вкладки «Файлы / Картинка / Копия»; «Картинка» строит PNG/BMP из выбранного блока (разрешение,
 пиксель, размер, толщина, стеной/на пол, меньше цветов, склейка одинаковых); подсказки при наведении.
+0.15.1: запускается старым компилятором loadstring (Solara): без «//», крупные разделы — в своих функциях
+(у него предел 200 регистров на функцию; проверка — luau-compile 0.590).
 ]]
 
-local VERSION = "0.15"
+local VERSION = "0.15.1"
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
@@ -336,14 +338,14 @@ local function have(name)
 	return v and v.Value or 0
 end
 
--- >>> img_core (17.10) — картинка -> постройка; только Luau (buffer, bit32), без Roblox API: проверяется luau.exe
+-- >>> img_core (17.10; без «//» — старый компилятор loadstring у Solara его не знает) — картинка -> постройка; только Luau (buffer, bit32), без Roblox API: проверяется luau.exe
 -- Img.decode(bytes) -> { w, h, px = buffer RGBA (w*h*4) } | nil, ошибка      (PNG — все виды, BMP 8/24/32 бит)
 -- Img.resample(img, W, H, yield) -> buffer RGBA W×H (среднее по клетке, прозрачность учитывается)
 -- Img.quantize(px, W, H, n) -> buffer RGBA, число цветов (медианное сечение; прозрачные не трогает)
 -- Img.rects(px, W, H, merge, maxW, maxH) -> { {x, y, w, h, hex} } (одинаковые соседи — одним прямоугольником)
 -- Img.place(rects, W, H, opt) -> список деталей для загрузчика (opt: kind, px, t, floor, y0)
+local Img = (function()                                     -- своя функция: у Luau предел 200 регистров на функцию
 local Img = {}
-do                                                          -- свои переменные — внутри (у Luau предел 200 локальных на функцию)
 
 local function u32be(b, o)
 	return buffer.readu8(b, o) * 16777216 + buffer.readu8(b, o + 1) * 65536 + buffer.readu8(b, o + 2) * 256 + buffer.readu8(b, o + 3)
@@ -525,7 +527,7 @@ local function decodePNG(b, yield)
 	if not ch then return nil, "неизвестный тип цвета PNG" end
 	if ctype == 3 and not plte then return nil, "нет палитры" end
 	local bitsPP = ch * depth
-	local bpp = math.max(1, bitsPP // 8)
+	local bpp = math.max(1, math.floor(bitsPP / 8))
 	-- проходы: без чересстрочности — один на всю картинку; Adam7 — семь
 	local passes
 	if interlace == 1 then
@@ -536,11 +538,11 @@ local function decodePNG(b, yield)
 	local total = 0
 	local dims = {}
 	for i, ps in ipairs(passes) do
-		local pw = (w - ps[1] + ps[3] - 1) // ps[3]
-		local ph = (h - ps[2] + ps[4] - 1) // ps[4]
+		local pw = math.floor((w - ps[1] + ps[3] - 1) / ps[3])
+		local ph = math.floor((h - ps[2] + ps[4] - 1) / ps[4])
 		if w <= ps[1] then pw = 0 end
 		if h <= ps[2] then ph = 0 end
-		local rowBytes = (pw * bitsPP + 7) // 8
+		local rowBytes = math.floor((pw * bitsPP + 7) / 8)
 		dims[i] = { pw, ph, rowBytes, total }
 		if pw > 0 and ph > 0 then total += ph * (rowBytes + 1) end
 	end
@@ -570,7 +572,7 @@ local function decodePNG(b, yield)
 					for x = 0, rowBytes - 1 do
 						local a = x >= bpp and buffer.readu8(raw, cur + x - bpp) or 0
 						local up = y > 0 and buffer.readu8(raw, prev + x) or 0
-						buffer.writeu8(raw, cur + x, (buffer.readu8(raw, cur + x) + (a + up) // 2) % 256)
+						buffer.writeu8(raw, cur + x, (buffer.readu8(raw, cur + x) + math.floor((a + up) / 2)) % 256)
 					end
 				elseif f == 4 then
 					for x = 0, rowBytes - 1 do
@@ -596,10 +598,10 @@ local function decodePNG(b, yield)
 		if depth == 8 then return buffer.readu8(raw, row + k) end
 		if depth == 16 then return buffer.readu8(raw, row + 2 * k) end   -- старший байт
 		local bitpos = k * depth
-		local byte = buffer.readu8(raw, row + bitpos // 8)
+		local byte = buffer.readu8(raw, row + math.floor(bitpos / 8))
 		return bit32.band(bit32.rshift(byte, 8 - depth - bitpos % 8), maxv)
 	end
-	local function scale(v) return depth >= 8 and v or (v * 255) // maxv end
+	local function scale(v) return depth >= 8 and v or math.floor(v * 255 / maxv) end
 	-- прозрачный цвет-ключ (gray/RGB): сравнение по исходным значениям
 	local key
 	if trns and (ctype == 0 or ctype == 2) then
@@ -664,7 +666,7 @@ local function decodeBMP(b)
 	local topDown = hh < 0
 	local h = math.abs(hh)
 	if w <= 0 or h == 0 or w * h > 16000000 then return nil, "странный размер" end
-	local stride = ((w * bpp + 31) // 32) * 4
+	local stride = math.floor((w * bpp + 31) / 32) * 4
 	if off + stride * h > buffer.len(b) then return nil, "файл оборван" end
 	local pal = 14 + hsz
 	local px = buffer.create(w * h * 4)
@@ -686,7 +688,7 @@ local function decodeBMP(b)
 				bl, g, r = buffer.readu8(b, pal + idx * 4), buffer.readu8(b, pal + idx * 4 + 1), buffer.readu8(b, pal + idx * 4 + 2)
 				a = 255
 			else
-				local q = row + x * (bpp // 8)
+				local q = row + x * math.floor(bpp / 8)
 				bl, g, r = buffer.readu8(b, q), buffer.readu8(b, q + 1), buffer.readu8(b, q + 2)
 				a = (bpp == 32 and alpha) and buffer.readu8(b, q + 3) or 255
 			end
@@ -716,13 +718,13 @@ function Img.resample(img, W, H, yield)
 	local out = buffer.create(W * H * 4)
 	local x0s, x1s = table.create(W, 0), table.create(W, 0)
 	for tx = 0, W - 1 do
-		local a = (tx * w) // W
-		local b = ((tx + 1) * w) // W
+		local a = math.floor(tx * w / W)
+		local b = math.floor((tx + 1) * w / W)
 		x0s[tx + 1] = a; x1s[tx + 1] = math.max(a + 1, b)
 	end
 	for ty = 0, H - 1 do
-		local y0 = (ty * h) // H
-		local y1 = math.max(y0 + 1, ((ty + 1) * h) // H)
+		local y0 = math.floor(ty * h / H)
+		local y1 = math.max(y0 + 1, math.floor((ty + 1) * h / H))
 		for tx = 0, W - 1 do
 			local sr, sg, sb, sa, cnt = 0, 0, 0, 0, 0
 			for y = y0, y1 - 1 do
@@ -781,7 +783,7 @@ function Img.quantize(px, W, H, n)
 		if not pick then break end
 		local box = boxes[pick]
 		table.sort(box, function(a, b) return ch(a, pc) < ch(b, pc) end)
-		local mid = #box // 2
+		local mid = math.floor(#box / 2)
 		local A, B = table.create(mid), table.create(#box - mid)
 		for k = 1, mid do A[k] = box[k] end
 		for k = mid + 1, #box do B[k - mid] = box[k] end
@@ -806,7 +808,7 @@ function Img.rects(px, W, H, merge, maxW, maxH)
 	end
 	local out, colors = {}, {}
 	local function hex(k)
-		return string.format("%02x%02x%02x", k // 65536, (k // 256) % 256, k % 256)
+		return string.format("%02x%02x%02x", math.floor(k / 65536), math.floor(k / 256) % 256, k % 256)
 	end
 	if not merge then
 		for y = 0, H - 1 do
@@ -870,7 +872,8 @@ function Img.place(rects, W, H, opt)
 	end
 	return items, need, lo, hi
 end
-end
+return Img
+end)()
 -- <<< img_core
 
 -- ===== предпросмотр: призрак постройки, только у тебя (детали создаются на клиенте, на сервер ничего не уходит) =====
@@ -1027,13 +1030,15 @@ local WHITE = Color3.new(1, 1, 1)
 local gui = new("ScreenGui", { Name = "BABFT_Loader", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Parent = parentGui })
 
 -- подсказка при наведении: через полсекунды под элементом (поверх окна)
+local tip
+do                                                           -- подсказка: свои переменные внутри блока
 local tipBox = new("Frame", { BackgroundColor3 = C.panel, AutomaticSize = Enum.AutomaticSize.XY, Visible = false, ZIndex = 50, Parent = gui },
 	{ corner(7), pad(9, 6) })
 do local st = stroke(C.stroke, 1, 0.2); st.Parent = tipBox end
 local tipText = label("", 11, C.text, false, { Size = UDim2.fromOffset(220, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
 	TextTruncate = Enum.TextTruncate.None, ZIndex = 51, Parent = tipBox })
 local tipToken = 0
-local function tip(obj, text)
+function tip(obj, text)
 	obj.MouseEnter:Connect(function()
 		tipToken += 1
 		local my = tipToken
@@ -1048,6 +1053,7 @@ local function tip(obj, text)
 		end)
 	end)
 	obj.MouseLeave:Connect(function() tipToken += 1; tipBox.Visible = false end)
+end
 end
 local W_FULL, W_COMPACT, H, HEAD = 860, 628, 650, 48
 local minimized, hidden = false, false
@@ -1608,7 +1614,9 @@ end
 -- Всё берётся из моделей на участке (workspace.Blocks[имя]): тип = имя модели, место/размер/цвет — главная деталь
 -- (CFrame относительно зоны хозяина, как в файлах Butter), настройки — значения внутри модели, связи — ControllerRef
 -- у получателя (ссылка на источник); клавиша сиденья — Bind-значение получателя. Только чтение, на сервер ничего.
-local Copy = {}
+local Copy, safeName, saveBuildFile
+do                                                           -- копия: свои переменные внутри блока
+Copy = {}
 local MV_NUM = { WaitDuration = "WaitDuration", Speed = "Speed", ExtendLength = "ExtendLength", SemitoneOffset = "Key" }
 local MV_BOOL = { "Additive", "Not", "Or", "And", "Xor", "NoWelds" }
 local BIND_NAMES = { "BindFire", "BindUp", "BindDown", "BindLeft", "BindRight" }
@@ -1693,12 +1701,12 @@ function Copy.snapshot(owner, onProgress)
 	end
 	return { Data = data, AutoBuild_Version = "v1" }, #list, links
 end
-local function safeName(str)
+function safeName(str)
 	local out = (str or ""):gsub('[\\/:*?"<>|%c]', "_"):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%.[Bb][Uu][Ii][Ll][Dd]$", "")
 	return out
 end
 -- записать постройку в папку построек: имя занято — _2, _3… (старое не затирается)
-local function saveBuildFile(name, tbl, fallback)
+function saveBuildFile(name, tbl, fallback)
 	local folder = (settings.folder and settings.folder ~= "") and settings.folder or "Butter-Builds"
 	if isfolder and makefolder and not isfolder(folder) then pcall(makefolder, folder) end
 	name = safeName(name)
@@ -1720,7 +1728,8 @@ function Copy.save(owner, name, onProgress)
 	return path, n, links
 end
 
-do                                                           -- вкладки «Копия» и «Картинка»: переменные внутри блока
+end
+local function buildTabs()                                   -- вкладки «Копия» и «Картинка»: своя функция (предел 200 регистров)
 -- ----- вкладка «Копия»: снять постройку с участка в файл -----
 caption("Чья постройка", pageCopy, 0)
 local copyRefresh = smallBtn(pageCopy, "обновить", 0, 0, 64, 18)
@@ -2172,6 +2181,7 @@ tip(stepBtn, "Шаг сдвига: 1, 5 или 10 стад")
 tip(rotBtn, "Повернуть постройку на 90°")
 tip(resetBtn, "Вернуть сдвиг и поворот как в файле")
 end
+buildTabs()
 
 -- ----- вид окна: компактный (без колонки файлов), свернуть, спрятать, открыть/закрыть -----
 local function layout(animate)
@@ -2241,6 +2251,7 @@ task.spawn(function()
 end)
 
 
+local function buildEngine()                                 -- своя функция: у старого компилятора loadstring предел 200 регистров
 -- ===== движок стройки =====
 -- Запрос занимает «слот» только пока сервер отвечает; появление блока подтверждается отдельно (по ChildAdded и месту).
 -- Турбо: число запросов разом подбирается по скорости (ответов в секунду), см. tune().
@@ -3274,6 +3285,9 @@ function Engine.fixLinks()                                   -- только с�
 			fmt(before), fmt(before - left), fmt(left), fmt(found), fmt(#job.items)), left == 0 and C.ok or C.warn)
 	end)
 end
+
+end
+buildEngine()
 
 -- ----- вид окна и старт -----
 compactBtn.MouseButton1Click:Connect(function() settings.compact = not settings.compact; saveSettings(); layout(true) end)
