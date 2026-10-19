@@ -44,9 +44,23 @@ BABFT_Loader/logs/.
 краска пачками до 2000 (растут, пока сервер успевает); пока ставятся блоки — их же растягивают и красят (после пробы).
 0.18: мелкие плитки (пиксель меньше 1) ставятся в ячейки перед картинкой и растяжкой сразу переносятся на место —
 большой блок не накрывает сотни соседей; турбо снижает число запросов, если ответ сервера вырос в разы (старт не выше 96).
+0.19: плитки картинки весят как целые блоки (плотность, до 100; переключатель «Масса»); плотность блока в копии и при
+сверке — средняя по всем деталям, как в игре.
+0.19.2: Xeno — список файлов (пути «./…», вложенные); имена построек — латиницей (русское имя ломает список у Xeno).
+0.19.3: картинка по ссылке — запрос как у браузера, у Fandom — исходный JPG (format=original), запасной HttpGet.
+0.20: «Способ» стройки картинки (1–4) для сравнения скорости; масса считается быстро (было ~13 с на 20 тыс. плиток).
+0.20.1: связи — проба способов перед стройкой (Xeno: связи не вставали), инструмент в руку напрямую, если не взялся.
+0.20.2: нет лага после блоков (плотность не пересчитывается без нужды).
+0.20.3: связи — следующий запрос, когда видны связи прошлого (медленный сервер теряет запросы, пока занят).
+0.20.4: связи — ждём до 3 мин, пока сервер (занятый после постройки) не начнёт их ставить.
+0.20.5: Xeno портит таблицу, отданную серверу, — связи ставились, а загрузчик их не видел. Серверу — копия.
+0.20.6: связи — до 48 разом, редкие потери не тормозят (дозапрос вторым кругом); ноты — шаги подряд.
+0.20.7: связи — без паузы между запросами (до 6 за кадр) — сервер стал терять запросы.
+0.20.8: связи — темп по интервалу (старт 30/с, без потерь — до 60/с, потери — реже).
+0.20.9: связи — потерянный признаётся через 3 с (было 8), каждый круг с 30/с, потолок 40/с.
 ]]
 
-local VERSION = "0.18"
+local VERSION = "0.20.9"
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
@@ -255,10 +269,65 @@ for _, n in ipairs({ "PlasticBlock", "MetalBlock", "WoodBlock", "GlassBlock", "N
 -- размер меняют и у дисплей-блока (17.10, со слов пользователя), но блоков он берёт как один — в расход не считаем
 local RESIZABLE = setmetatable({ DisplayBlock = true }, { __index = SCALABLE })
 
+-- listfiles у исполнителей разный (19.10, Xeno: постройки и папки не видны): пробуем варианты пути; имя без папки —
+-- дополняем папкой (иначе readfile не найдёт). Пусто во всех — что ответил исполнитель, пишется в
+-- BABFT_Loader/logs/listfiles_diag.txt (по каждой папке один раз).
+local diagDone = {}                                          -- [папка] = true; по порядку — строки отчёта
+local function listDir(folder)
+	local tries = folder == "" and { "", ".", "./", "/" }
+		or { folder, folder .. "/", "./" .. folder, (folder:gsub("/", "\\")), (folder:gsub("/", "\\")) .. "\\" }
+	local okAny, report = false, {}
+	for _, f in ipairs(tries) do
+		local ok, list = pcall(listfiles, f)
+		local line = ("listfiles(%q): ok=%s type=%s"):format(f, tostring(ok), typeof(list))
+		if ok and type(list) == "table" then
+			okAny = true
+			line ..= (" n=%d"):format(#list)
+			for i = 1, math.min(4, #list) do line ..= (" [%s %q]"):format(typeof(list[i]), tostring(list[i])) end
+			local out = {}
+			for _, x in ipairs(list) do
+				x = tostring(x):gsub("^%.[/\\]", "")              -- Xeno: «./папка/файл»
+				local head = (x:sub(1, #folder + 1):gsub("\\", "/"))
+				if folder == "" or head == folder .. "/" then
+					-- Xeno отдаёт и вложенные (весь обход) — берём только прямых детей папки
+					local rest = folder == "" and x or x:sub(#folder + 2)
+					if rest ~= "" and not rest:find("[/\\]") then table.insert(out, x) end
+				elseif not x:find("[/\\]") then
+					table.insert(out, folder .. "/" .. x)             -- одно имя без папки
+				else
+					table.insert(out, x)                              -- другой вид пути (полный) — как есть
+				end
+			end
+			if #out > 0 then return out, true end
+		elseif not ok then
+			line ..= " err=" .. tostring(list)
+		end
+		table.insert(report, line)
+	end
+	if not diagDone[folder] and writefile then                 -- для разбора: что вернул исполнитель (по папке — раз)
+		diagDone[folder] = true
+		pcall(function()
+			local exe = "?"
+			pcall(function() exe = table.concat({ identifyexecutor() }, " ") end)
+			if #diagDone == 0 then
+				table.insert(diagDone, "Xeno 1.3.60: listfiles обходит весь workspace и обрывается на первом имени с русскими "
+					.. "буквами — всё после него не видно. Проверь имена файлов и папок в workspace.")
+			end
+			table.insert(diagDone, ("исполнитель %s · папка %q · isfolder=%s"):format(exe, folder,
+				tostring(isfolder and select(2, pcall(isfolder, folder)))))
+			for _, l in ipairs(report) do table.insert(diagDone, "  " .. l) end
+			if makefolder and isfolder and not isfolder(SETTINGS_DIR) then makefolder(SETTINGS_DIR) end
+			if makefolder and isfolder and not isfolder(SETTINGS_DIR .. "/logs") then makefolder(SETTINGS_DIR .. "/logs") end
+			writefile(SETTINGS_DIR .. "/logs/listfiles_diag.txt", table.concat(diagDone, "\n"))
+		end)
+	end
+	return {}, okAny
+end
+
 local function listBuilds(folder)
 	local out = {}
-	local ok, files = pcall(listfiles, folder)
-	if not ok or type(files) ~= "table" then return out, false end
+	local files, ok = listDir(folder)
+	if not ok then return out, false end
 	for _, p in ipairs(files) do
 		local name = p:match("([^/\\]+)$") or p
 		if name:lower():match("%.build$") or name:lower():match("%.json$") then
@@ -271,8 +340,8 @@ end
 
 local function listFolders()
 	local out = {}
-	local ok, items = pcall(listfiles, "")
-	if ok and type(items) == "table" then
+	local items, ok = listDir("")
+	if ok then
 		for _, p in ipairs(items) do
 			if isfolder and isfolder(p) then
 				local n = p:match("([^/\\]+)$") or p
@@ -1190,9 +1259,9 @@ function Img.decode(bytes, yield)
 	if n >= 2 and buffer.readstring(b, 0, 2) == "BM" then return decodeBMP(b) end
 	if n >= 3 and buffer.readu8(b, 0) == 255 and buffer.readu8(b, 1) == 216 then return decodeJPEG(b, yield) end
 	if n >= 12 and buffer.readstring(b, 0, 4) == "RIFF" and buffer.readstring(b, 8, 4) == "WEBP" then
-		return nil, "WEBP не умею — сохрани картинку как PNG"
+		return nil, "WebP не умею — скачай картинку и перетащи на kartinki_syuda.bat (переведёт в PNG)"
 	end
-	if n >= 5 and buffer.readstring(b, 0, 5):lower():find("<") then return nil, "это не картинка (похоже на страницу сайта)" end
+	if n >= 5 and buffer.readstring(b, 0, 5):lower():find("<") then return nil, "сайт прислал страницу, а не картинку (защита от ботов?) — сохрани картинку в браузере и перетащи на kartinki_syuda.bat" end
 	return nil, "не PNG, JPG и не BMP"
 end
 
@@ -1399,6 +1468,56 @@ local function itemSize(it)
 	local s = it.size
 	if type(s) == "table" then return Vector3.new(s[1] or 2, s[2] or 2, s[3] or 2) end
 	return Vector3.new(2, 2, 2)
+end
+
+-- Плотность блока — как свойство «Density» в игре (BlockProperties): средняя по объёму ВСЕХ деталей модели (объём =
+-- Mass / плотность). Так же её пишет Butter (Switch 6.6653, Gate 0.9697 — таких материалов нет). Главная деталь бывает
+-- из другого материала, поэтому по ней одной (как было до 0.19) копия могла записать блоку чужую плотность.
+local Phys = { kinds = {}, sent = setmetatable({}, { __mode = "k" }) }   -- sent[модель]: плотность ей уже меняли
+function Phys.density(m)
+	local vol, sum = 0, 0
+	for _, p in ipairs(m:GetDescendants()) do
+		if p:IsA("BasePart") then
+			local cp = p.CurrentPhysicalProperties
+			local d = cp and cp.Density
+			if type(d) == "number" and d > 0 then
+				local v = p.Mass / d
+				if v > 0 then vol += v; sum += d * v end
+			end
+		end
+	end
+	return vol > 0 and sum / vol or nil
+end
+function Phys.kind(kind)                                     -- образец блока: плотность и объём главной детали
+	if Phys.kinds[kind] == nil then
+		local info = false
+		pcall(function()
+			local src = game:GetService("ReplicatedStorage"):FindFirstChild("BuildingParts")
+			src = src and src:FindFirstChild(kind)
+			local pp = src and (src.PrimaryPart or src:FindFirstChild("PPart"))
+			local d = src and Phys.density(src)
+			if pp and d then info = { d0 = d, vp = pp.Size.X * pp.Size.Y * pp.Size.Z } end
+		end)
+		Phys.kinds[kind] = info
+	end
+	return Phys.kinds[kind] or nil
+end
+-- Плитка меньше целого блока — и во столько же раз легче (масса = плотность × объём; 0.1×0.1×0.4 легче блока 2×2×2 в
+-- 2000 раз). Плотность, при которой плитка весит как целый блок; игра даёт от 0.0001 до 100, совсем мелким — сколько
+-- выйдет. Возвращает, какую долю массы удалось сохранить (в среднем по плиткам).
+function Phys.keepMass(items, kind)
+	local k = Phys.kind(kind)
+	if not k then return nil end
+	local kept, n = 0, 0
+	for _, it in ipairs(items) do
+		local s3 = itemSize(it)
+		local need = k.d0 * k.vp / math.max(1e-6, s3.X * s3.Y * s3.Z)
+		local d = math.clamp(tonumber(string.format("%.3g", need)) or need, 0.0001, 100)
+		it.mv = it.mv or {}
+		it.mv.Density = d
+		kept += math.min(1, d / need); n += 1
+	end
+	return n > 0 and kept / n or nil
 end
 
 local function ghostify(p, tr, keep)                 -- keep: невидимые детали модели оставить невидимыми
@@ -2077,7 +2196,12 @@ local function loadFolder(folder)
 		say("Папка «" .. folder .. "» не найдена в workspace исполнителя.", C.bad)
 	else
 		settings.folder = folder; saveSettings()
-		say(("В папке «%s» построек: %d"):format(folder, #files))
+		if #files == 0 and isfolder and isfolder(folder) then
+			say(("В «%s» построек не видно. Если они там есть: у Xeno список ломает имя с русскими буквами в workspace — "
+				.. "переименуй латиницей."):format(folder), C.warn)
+		else
+			say(("В папке «%s» построек: %d"):format(folder, #files))
+		end
 	end
 	markChips()
 	renderFiles()
@@ -2164,8 +2288,8 @@ function Copy.snapshot(owner, onProgress)
 			if v and v:IsA("BoolValue") then mv[n] = v.Value end
 		end
 		if m:HasTag("Legacy") then mv.Legacy = true end
-		local okD, dens = pcall(function() return pp.CurrentPhysicalProperties.Density end)
-		if okD and type(dens) == "number" then mv.Density = r4(dens) end
+		local dens = Phys.density(m)                        -- по всем деталям, как в игре и в Butter
+		if dens then mv.Density = r4(dens) end
 		b.MValues = mv
 		local binds, key = {}, nil
 		for _, ch in ipairs(m:GetChildren()) do
@@ -2185,8 +2309,9 @@ function Copy.snapshot(owner, onProgress)
 	end
 	return { Data = data, AutoBuild_Version = "v1" }, #list, links
 end
-function safeName(str)
-	local out = (str or ""):gsub('[\\/:*?"<>|%c]', "_"):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%.[Bb][Uu][Ii][Ll][Dd]$", "")
+function safeName(str)                                       -- латиницей: у Xeno русское имя в workspace ломает список файлов
+	local out = (str or ""):gsub(utf8.charpattern, function(ch) return TRANSLIT[ch] or (#ch > 1 and "_" or nil) end)
+		:gsub('[\\/:*?"<>|%c]', "_"):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%.[Bb][Uu][Ii][Ll][Dd]$", "")
 	return out
 end
 -- записать постройку в папку построек: имя занято — _2, _3… (старое не затирается)
@@ -2312,6 +2437,8 @@ IS.t = tonumber(IS.t) or 0.4
 IS.floor = IS.floor == true
 IS.colors = math.clamp(math.floor(tonumber(IS.colors) or 2), 1, 4)
 IS.merge = IS.merge ~= false
+IS.mass = IS.mass ~= false                                   -- плитки весят как целые блоки (Phys.keepMass)
+IS.method = math.clamp(math.floor(tonumber(IS.method) or 1), 1, 4)   -- способ стройки (сравнение скорости, 0.20)
 IS.kind = type(IS.kind) == "string" and IS.kind or "PlasticBlock"
 local COLORS_N = { 0, 32, 16, 8 }                           -- 0 — все цвета как есть
 local MAX_SIDE = 48                                          -- стад: длиннее плиту не склеиваем
@@ -2319,7 +2446,7 @@ local imgCur = nil                                           -- { name, img = {w
 local imgRegen                                               -- ниже: пересчёт картинки
 
 local imgScroll = new("ScrollingFrame", { BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1),
-	ScrollBarThickness = 3, ScrollBarImageColor3 = C.stroke, CanvasSize = UDim2.fromOffset(0, 690), Parent = pageImage })
+	ScrollBarThickness = 3, ScrollBarImageColor3 = C.stroke, CanvasSize = UDim2.fromOffset(0, 754), Parent = pageImage })
 local IW = -6                                                -- ширина содержимого: 1, IW (место под полосу прокрутки)
 caption("Картинка", imgScroll, 0)
 local imgChips = new("ScrollingFrame", { BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, IW, 0, 24), Position = UDim2.fromOffset(0, 16),
@@ -2393,8 +2520,18 @@ rowLabel("Склеивать", Y0 + 192, "Соседние пиксели одн
 local mergeSw = switch(imgScroll, UDim2.fromOffset(72, Y0 + 194), function(on) IS.merge = on; saveSettings(); imgRegen() end)
 label("одинаковые — одной плитой", 10, C.faint, false, { Position = UDim2.fromOffset(116, Y0 + 192), Size = UDim2.new(1, -116 + IW, 0, 26),
 	TextWrapped = true, TextTruncate = Enum.TextTruncate.None, Parent = imgScroll })
+rowLabel("Масса", Y0 + 224, "Плитка меньше целого блока — и во столько же раз легче. Вкл — загрузчик поднимает ей плотность (Density), чтобы "
+	.. "весила как целый блок. Игра даёт плотность до 100, поэтому совсем мелкие — сколько выйдет (видно в строке под картинкой).")
+local massSw = switch(imgScroll, UDim2.fromOffset(72, Y0 + 226), function(on) IS.mass = on; saveSettings(); imgRegen() end)
+label("как у целого блока", 10, C.faint, false, { Position = UDim2.fromOffset(116, Y0 + 224), Size = UDim2.new(1, -116 + IW, 0, 26),
+	TextWrapped = true, TextTruncate = Enum.TextTruncate.None, Parent = imgScroll })
+rowLabel("Способ", Y0 + 256, "Сравнение скорости. 1 — как раньше. 2 — растяжка сразу, до 128 разом. 3 — блок ставится в ячейку перед "
+	.. "картинкой и переносится на место (при любом пикселе). 4 — похожие цвета склеиваются: плиток меньше.")
+local methodSeg = segmented(imgScroll, UDim2.fromOffset(72, Y0 + 256), UDim2.fromOffset(122, 26), { "1", "2", "3", "4" }, false, function(i)
+	IS.method = i; saveSettings(); imgRegen()
+end)
 -- внизу: «Построить» сразу (без файла) и «В файл»
-local imgBuildHolder = new("Frame", { BackgroundColor3 = WHITE, Position = UDim2.fromOffset(0, Y0 + 232), Size = UDim2.new(1, IW - 84, 0, 32),
+local imgBuildHolder = new("Frame", { BackgroundColor3 = WHITE, Position = UDim2.fromOffset(0, Y0 + 296), Size = UDim2.new(1, IW - 84, 0, 32),
 	Parent = imgScroll }, { corner(9) })
 accentGradient(imgBuildHolder, 0)
 local imgBuild = new("TextButton", { Text = "Построить", TextSize = 13, Font = FONT_H, TextColor3 = WHITE, BackgroundTransparency = 1,
@@ -2405,8 +2542,8 @@ do
 	imgBuild.MouseButton1Up:Connect(function() tween(sc, { Scale = 1 }, 0.3, Enum.EasingStyle.Back) end)
 end
 tip(imgBuild, "Сразу построить картинку на участке — без сохранения файла. Где встанет — видно призраком (включи «Превью»).")
-local imgSave = smallBtn(imgScroll, "В файл", 0, Y0 + 233, 78, 30)
-imgSave.Position = UDim2.new(1, IW - 78, 0, Y0 + 233)
+local imgSave = smallBtn(imgScroll, "В файл", 0, Y0 + 297, 78, 30)
+imgSave.Position = UDim2.new(1, IW - 78, 0, Y0 + 297)
 tip(imgSave, "Сохранить картинку файлом .Build — потом её можно строить из вкладки «Файлы»")
 
 local function refreshFields()
@@ -2421,6 +2558,8 @@ local function refreshFields()
 	floorSeg.set(IS.floor and 2 or 1, true)
 	colorSeg.set(IS.colors, true)
 	mergeSw.set(IS.merge)
+	massSw.set(IS.mass)
+	methodSeg.set(IS.method, true)
 end
 
 -- 2D-превью: прямоугольники — рамками (много — грубее, по сетке до 96)
@@ -2461,6 +2600,11 @@ function imgRegen(keepNothing)                               -- пересчит
 		local H = imgCur.H
 		local t0 = os.clock()
 		local px = Img.resample(img, W, H, function() task.wait() end)
+		if IS.method == 4 then                                -- способ 4: похожие цвета — одним
+			for i = 0, W * H * 4 - 1 do
+				if i % 4 ~= 3 then buffer.writeu8(px, i, math.min(255, math.floor(buffer.readu8(px, i) / 8 + 0.5) * 8)) end
+			end
+		end
 		if my ~= regenToken then return end
 		local nColors = COLORS_N[IS.colors]
 		local ncol
@@ -2474,9 +2618,11 @@ function imgRegen(keepNothing)                               -- пересчит
 			return
 		end
 		local items, need, lo, hi = Img.place(rects, W, H, { kind = IS.kind, px = IS.px, t = IS.t, floor = IS.floor, y0 = PLOT.y, units = unitsOf })
+		local kept = IS.mass and Phys.keepMass(items, IS.kind) or nil
 		local info = { kinds = { [IS.kind] = need }, blocks = need, parts = #items, links = 0, items = items, lo = lo, hi = hi,
-			note = ("картинка %d×%d · цветов %d · %s × %s стад"):format(W, H, nc, fmt(W * IS.px), fmt(H * IS.px)) }
+			method = IS.method, note = ("картинка %d×%d · цветов %d · %s × %s стад"):format(W, H, nc, fmt(W * IS.px), fmt(H * IS.px)) }
 		imgInfo.Text = ("%d × %d пикс · %s плиток · %.2f с"):format(W, H, fmt(#items), os.clock() - t0)
+			.. ((kept and kept < 0.995) and (" · масса %d %%"):format(math.max(1, math.floor(kept * 100 + 0.5))) or "")
 		imgInfo.TextColor3 = #items > 6000 and C.warn or C.muted
 		imgCur.info = info
 		if Engine.running then return end                     -- во время стройки постройку не подменяем
@@ -2566,7 +2712,11 @@ local function openImage(name, getBytes)
 	task.spawn(function()
 		local okB, bytes = pcall(getBytes)
 		if not okB or type(bytes) ~= "string" or #bytes == 0 then
-			imgInfo.Text = "не получилось прочитать: " .. tostring(bytes); imgInfo.TextColor3 = C.bad; return
+			local why = okB and "пусто" or tostring(bytes)
+			imgInfo.Text = "не получилось прочитать: " .. why; imgInfo.TextColor3 = C.bad
+			say("Картинка не скачалась: " .. why, C.bad)               -- целиком: в строке под превью не влезает
+			Log.w("IMG %s: не прочитана: %s", name, why)
+			return
 		end
 		local t0 = os.clock()
 		local ok, img, err = pcall(Img.decode, bytes, function() task.wait() end)
@@ -2591,9 +2741,9 @@ local function imgRefreshList()
 	if makefolder and isfolder and not isfolder(IMG_DIR) then pcall(makefolder, IMG_DIR) end
 	for _, c in ipairs(imgChips:GetChildren()) do if c:IsA("GuiObject") then c:Destroy() end end
 	imgChipBtns = {}
-	local ok, list = pcall(listfiles, IMG_DIR)
+	local list, ok = listDir(IMG_DIR)
 	local n = 0
-	if ok and type(list) == "table" then
+	if ok then
 		table.sort(list)
 		for _, p in ipairs(list) do
 			local name = p:match("([^/\\]+)$") or p
@@ -2621,7 +2771,7 @@ local function imgRefreshList()
 end
 -- папку картинок смотрим раз в 2 с, пока открыта вкладка: новый файл (положили с ПК) открывается сам
 local function imgNames()
-	local ok, list = pcall(listfiles, IMG_DIR)
+	local list, ok = listDir(IMG_DIR)
 	local out = {}
 	if ok and type(list) == "table" then
 		for _, p in ipairs(list) do
@@ -2666,15 +2816,36 @@ end)
 urlBtn.MouseButton1Click:Connect(function()
 	local url = urlBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
 	if not url:match("^https?://") then imgInfo.Text = "нужна ссылка вида https://…"; imgInfo.TextColor3 = C.warn; return end
-	local name = (url:match("([^/?#]+)[?#]?[^/]*$") or "картинка"):sub(1, 40)
+	local name                                               -- имя: последний кусок с расширением картинки
+	for seg in url:gsub("[?#].*$", ""):gmatch("[^/]+") do     -- (у Fandom после него «/revision/latest»)
+		local ext = seg:lower():match("%.(%a+)$")
+		if ext == "png" or ext == "jpg" or ext == "jpeg" or ext == "bmp" or ext == "webp" or ext == "gif" then name = seg end
+	end
+	name = (name or url:match("([^/?#]+)[?#]?[^/]*$") or "картинка"):sub(1, 40)
 	openImage(name, function()
+		-- Fandom (19.10, Xeno): без format=original отдаёт WebP; запрос без заголовка или с поддельным браузерным —
+		-- 403 / страница Cloudflare «Just a moment…»; с User-Agent Roblox — сама картинка (проверено 4 из 4)
+		if url:find("wikia%.nocookie%.net") and not url:find("format=", 1, true) then
+			url ..= (url:find("?", 1, true) and "&" or "?") .. "format=original"
+		end
+		local errs, page = {}, nil
+		local function html(b) return b:sub(1, 64):match("^%s*<") ~= nil end   -- страница сайта, не картинка
 		local req = (syn and syn.request) or http_request or request
 		if req then
-			local r = req({ Url = url, Method = "GET" })
-			if r and r.Body and (r.StatusCode == nil or r.StatusCode < 400) then return r.Body end
-			error("сервер ответил " .. tostring(r and r.StatusCode))
+			local ok, r = pcall(req, { Url = url, Method = "GET", Headers = { ["User-Agent"] = "Roblox/WinInet", ["Accept"] = "*/*" } })
+			local code = ok and type(r) == "table" and tonumber(r.StatusCode) or nil
+			if ok and type(r) == "table" and type(r.Body) == "string" and #r.Body > 0 and (code == nil or code < 400) then
+				if not html(r.Body) then return r.Body end
+				page = r.Body
+			end
+			table.insert(errs, ok and ("сервер ответил " .. tostring(type(r) == "table" and r.StatusCode or r)) or tostring(r))
 		end
-		return game:HttpGet(url)
+		local ok, body = pcall(function() return game:HttpGet(url) end)  -- запасной: запрос самой игры
+		if ok and type(body) == "string" and #body > 0 and not html(body) then return body end
+		if ok and type(body) == "string" and #body > 0 then page = page or body end
+		if page then return page end                              -- разбор скажет «похоже на страницу сайта»
+		table.insert(errs, "HttpGet: " .. tostring(body))
+		error(table.concat(errs, "; "), 0)
 	end)
 end)
 imgSave.MouseButton1Click:Connect(function()
@@ -2820,10 +2991,14 @@ local function equip(name)
 	if not t then return nil end
 	if t.Parent ~= lp.Character then
 		local h = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
-		if h then h:EquipTool(t) end
+		if h then pcall(function() h:EquipTool(t) end) end
 		task.wait(0.4)
+		if t.Parent ~= lp.Character and lp.Character then       -- 19.10, Xeno: EquipTool мог не сработать — в руку напрямую
+			pcall(function() t.Parent = lp.Character end)
+			task.wait(0.3)
+		end
 	end
-	Log.w("EQUIP %s", name)
+	Log.w("EQUIP %s%s", name, t.Parent == lp.Character and "" or " — НЕ в руках")
 	return t
 end
 
@@ -3015,7 +3190,7 @@ function Index.reset(root)
 end
 
 local function makeJob(info)
-	local job = { items = {}, byId = {} }
+	local job = { items = {}, byId = {}, method = info.method }
 	for _, it in ipairs(info.items) do
 		local wcf = Preview.toWorld(itemCF(it))
 		local j = { it = it, kind = it.kind, wcf = wcf, wpos = wcf.Position }
@@ -3294,9 +3469,14 @@ local function stagePlace(job)
 	setBar(1, (total - #todo) / math.max(1, total))
 	local tool = (#todo > 0) and equip("BuildingTool") or nil
 	if #todo > 0 and not tool then conn:Disconnect(); return false, "нет инструмента BuildingTool" end
+	if job.method then
+		local I = settings.img or {}
+		Log.w("METHOD %d · пиксель %s · толщина %s · цвета %s · склейка %s · масса %s · плиток %d", job.method, tostring(I.px),
+			tostring(I.t), tostring(({ "все", "32", "16", "8" })[I.colors or 1]), tostring(I.merge), tostring(I.mass), total)
+	end
 	local staged = false                                     -- ячейки перед картинкой (см. Staged)
 	Staged.on, Staged.slots, Staged.free = false, {}, {}
-	if #todo >= 100 and settings.mode == 3 and settings.staged ~= false and Staged.small(job)
+	if #todo >= 100 and settings.mode == 3 and settings.staged ~= false and (job.method == 3 or Staged.small(job))
 		and Staged.setup(job, math.clamp(math.floor(#todo / 4), 16, 192)) then
 		Staged.on = true
 		staged = Staged.probe(job, todo, tool)
@@ -3534,7 +3714,7 @@ function eagerStart(job, staged)
 	task.spawn(function()                                    -- размеры
 		local probe = {}
 		while E.on and E.sMode ~= "нет" do
-			local cap = E.sMode == "проба" and 6 or (staged and 96 or 32)
+			local cap = E.sMode == "проба" and 6 or ((staged or job.method == 2) and (job.method == 2 and 128 or 96) or 32)
 			while E.inflight < cap and hS <= #qS and (E.sMode ~= "проба" or #probe < 6) do
 				local j = qS[hS]; hS += 1
 				if E.sMode == "проба" then table.insert(probe, j) end
@@ -3615,7 +3795,8 @@ local function propOps(job, onlyAnchor)                     -- onlyAnchor: то�
 		if not groups[k] then groups[k] = { name = name, text = text, models = {} }; table.insert(order, groups[k]) end
 		table.insert(groups[k].models, m)
 	end
-	for _, j in ipairs(job.items) do
+	for idx, j in ipairs(job.items) do
+		if idx % 400 == 0 then task.wait() end                  -- не замораживать кадр (Xeno, 19.10: 5.8 с без кадров)
 		local m, it = j.model, j.it
 		if onlyAnchor then
 			if m and m.Parent and m.PrimaryPart and type(it.anchored) == "boolean" and it.anchored ~= m.PrimaryPart.Anchored then
@@ -3641,9 +3822,12 @@ local function propOps(job, onlyAnchor)                     -- onlyAnchor: то�
 			if math.abs((m:GetAttribute("Transparency") or 0) - tr) > 0.005 then
 				add("Transparency", tostring(math.floor(tr * 100 + 0.5)), m)
 			end
-			if type(mv.Density) == "number" then
-				local ok, cur = pcall(function() return m.PrimaryPart.CurrentPhysicalProperties.Density end)
-				if ok and math.abs(cur - mv.Density) > 1e-3 then add("Density", tostring(mv.Density), m) end
+			if type(mv.Density) == "number" and j.densOk ~= m then  -- совпало — больше не считаем (20 тыс. блоков — секунды)
+				local want = math.clamp(mv.Density, 0.0001, 100)   -- пределы игры
+				local k = not Phys.sent[m] and Phys.kind(j.kind) or nil   -- ещё не меняли — как у образца, считать незачем
+				local cur = k and k.d0 or Phys.density(m)
+				if cur and math.abs(cur - want) > math.max(1e-3, want * 0.005) then add("Density", tostring(want), m)
+				elseif cur then j.densOk = m end
 			end
 			local function flag(name, want, cur)
 				if type(want) == "boolean" and type(cur) == "boolean" and want ~= cur then add(name, nil, m) end
@@ -3711,6 +3895,7 @@ local function stageProps(job)
 		Log.w("ROUND настройки %d: запросов %d", round, #tasks)
 		runPool("prop", tasks, function(t)
 			local t0 = os.clock()
+			if t.name == "Density" then for _, m in ipairs(t.models) do Phys.sent[m] = true end end
 			if t.text ~= nil then tool.SetPropertieRF:InvokeServer(t.name, t.models, t.text)
 			else tool.SetPropertieRF:InvokeServer(t.name, t.models) end
 			Log.w("SEND prop %s (%d) ответ %.3f с", t.name, #t.models, os.clock() - t0)
@@ -3721,7 +3906,7 @@ local function stageProps(job)
 		end)
 		settle(function() return #propOps(job) end, "настройки")
 	end
-	for _ = 1, 2 do                                          -- ноты: по шагу, сразу всем, кому ещё нужно
+	for pass = 1, 2 do                                       -- ноты: по шагу, сразу всем, кому ещё нужно
 		local list = noteSteps(job)
 		if #list == 0 or Engine.stopFlag then break end
 		local maxSteps = 0
@@ -3731,11 +3916,18 @@ local function stageProps(job)
 			if not waitRun() then break end
 			local ms = {}
 			for _, n in ipairs(list) do if n.steps >= s then table.insert(ms, n.m) end end
-			runPool("note", chunks(ms, 200), function(ch) tool.SetPropertieRF:InvokeServer("Key", ch); return true end)
+			if pass == 1 then                                    -- подряд, не дожидаясь ответа (19.10: по очереди — 8 с)
+				for _, ch in ipairs(chunks(ms, 200)) do
+					task.spawn(function() pcall(function() tool.SetPropertieRF:InvokeServer("Key", ch) end) end)
+				end
+				task.wait(0.05)
+			else
+				runPool("note", chunks(ms, 200), function(ch) tool.SetPropertieRF:InvokeServer("Key", ch); return true end)
+			end
 			setBar(4, 0.8 + 0.2 * s / maxSteps)
 			say(("Ноты: шаг %d из %d"):format(s, maxSteps))
 		end
-		task.wait(0.7)
+		task.wait(pass == 1 and 1.5 or 0.7)
 	end
 	setBar(4, 1)
 	for _, op in ipairs(propOps(job)) do                     -- что не встало: хочу / стоит у первого блока
@@ -3825,9 +4017,11 @@ end
 -- Один запрос соединяет все источники со всеми входами получателей, поэтому одинаковые наборы склеиваются.
 local BIND_GAP = { 0.25, 0.08, 0.045 }                       -- стартовый интервал между запросами связей по режимам, с
 local BIND_GAP_MIN, BIND_GAP_MAX = 0.02, 0.5
-local BIND_INFLIGHT = 24                                     -- запросов без ответа максимум
+local BIND_INFLIGHT = 48                                     -- запросов связей разом максимум (19.10: 24 шли без потерь)
 local BIND_TIMEOUT = 10                                      -- нет ответа дольше — запрос неудачный
 local BIND_GRACE = 1.5                                       -- сколько ждать опоздавших связей после круга, с
+local BIND_WAIT = 3                                          -- не видны связи запроса дольше — потерян (19.10: видны через 0.4–0.6 с)
+local BIND_PATIENCE = 180                                    -- сколько ждать, пока сервер вообще начнёт ставить связи, с
 local BIND_ROUNDS = 8                                        -- кругов максимум; без прогресса 2 круга подряд — стоп
 
 -- недостающие пары -> запросы { ss = источники, rs = получатели }; только точные пары, лишних связей не бывает
@@ -3901,92 +4095,156 @@ local function stageBinds(job)
 	if total == 0 then setBar(5, 1); return true, 0 end
 	local tool = equip("BindTool")
 	if not tool then return false, "нет инструмента BindTool" end
-	local mode = settings.mode
-	local gap0 = BIND_GAP[mode] or BIND_GAP[2]
-	local gap, idle = gap0, 0
+	-- Связи (19.10, Xeno, сервер с 5 игроками): ответ на запрос — 0.1 с, а связи появляются через 2+ с; запрос,
+	-- пришедший, пока сервер занят прошлым, теряется (16.10 это стоило 0.1 с, теперь секунды). Поэтому запрос сделан,
+	-- только когда его связи ВИДНЫ (ждём до BIND_WAIT). Сколько разом — подбирается: +1 после 4 удачных подряд;
+	-- не прошло — на 1 меньше, и выше больше не поднимаем. Сначала проба: не видно ни одного — связи пропускаются.
+	local function seenOf(t)
+		local n = 0
+		for _, r in ipairs(t.rs) do
+			local set = linkSet(r)
+			for _, src in ipairs(t.ss) do if set[src] then n += 1 end end
+		end
+		return n
+	end
+	local function send(t)                                      -- запрос в фоне; ответ — rec.ans, ошибка — rec.err
+		local rec = { t = t, t0 = os.clock(), want = #t.ss * #t.rs }
+		local inputs = {}
+		for _, r in ipairs(t.rs) do addInputs(inputs, r) end
+		task.spawn(function()
+			local keys, needKeys = {}, false
+			if t.k and t.k ~= -1 then
+				for action in pairs(inputs) do keys[action] = t.k end
+				needKeys = true
+			end
+			-- копия: Xeno портит таблицу, переданную в InvokeServer, — сверять связи с t.ss после этого нельзя (19.10)
+			local srcs = table.move(t.ss, 1, #t.ss, 1, {})
+			local ok, err = pcall(function() return tool.RF:InvokeServer(inputs, srcs, keys, false, needKeys) end)
+			rec.ans = os.clock() - rec.t0
+			if not ok then rec.err = tostring(err) end
+		end)
+		return rec
+	end
+	do                                                          -- проба: когда сервер начнёт ставить связи
+		local probe = bindTasks(todo)
+		local okAny, sentP, t0 = false, {}, os.clock()
+		local h = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+		if h then pcall(function() h:UnequipTools() end) end   -- взять инструмент связей с пустой руки
+		task.wait(0.5)
+		tool = equip("BindTool") or tool
+		local nextAt, v = 0, 0
+		while not Engine.stopFlag and os.clock() - t0 < BIND_PATIENCE and #probe > 0 do
+			if os.clock() >= nextAt then                          -- раз в 10 с — следующий пробный запрос
+				v = v % math.min(#probe, 20) + 1
+				table.insert(sentP, send(probe[v]))
+				nextAt = os.clock() + 10
+			end
+			task.wait(0.2)
+			for _, rec in ipairs(sentP) do
+				local seen = seenOf(rec.t)
+				if seen > 0 then
+					okAny = true
+					Log.w("BINDPROBE: связь видна через %.1f с после начала связей (запрос №%d, ему %.1f с, ответ %s)",
+						os.clock() - t0, table.find(sentP, rec), os.clock() - rec.t0, rec.ans and ("%.2f с"):format(rec.ans) or "—")
+					break
+				end
+			end
+			if okAny then break end
+			say(("Связи: сервер пока не ставит (занят после постройки?) — жду %d с из %d…"):format(
+				math.floor(os.clock() - t0), BIND_PATIENCE), C.warn)
+		end
+		if not okAny and #probe > 0 and not Engine.stopFlag then
+			Log.w("BINDPROBE: за %d с (%d пробных запросов) не появилось ни одной связи — связи не ставлю", BIND_PATIENCE, #sentP)
+			say("Связи не ставятся: сервер 3 минуты не соединяет (журнал, строки BINDPROBE). Остальное достраиваю.", C.bad)
+			return false, #todo                                 -- число, не текст: «отпустить» после связей ещё нужен
+		end
+		task.wait(1)                                            -- опоздавшие ответы проб
+		todo = missingLinks(job)
+	end
+	local cap, idle, byAnswer, gap = 4, 0, true, 1 / 30         -- gap — интервал между запросами, с
 	for round = 1, BIND_ROUNDS do
 		if #todo == 0 or not waitRun() then break end
 		tool = equip("BindTool") or tool
 		local tasks = bindTasks(todo)
 		local before = #todo
-		local sent, okN, badN, seenNow, inflight, nextAt, lastRaise = 0, 0, 0, 0, 0, 0, 0
-		local running = {}
+		local sent, okN, badN, seenNow, streak, dsum, lastCheck = 0, 0, 0, 0, 0, 0, 0
+		local recent = {}                                       -- последние 40 исходов: true — потеря
+		local lastSend = 0
+		gap = math.min(gap, 1 / 30)                             -- круг — с 30/с (потери прошлого досчитывались после отправки)
+		local pending, waiting = {}, {}                          -- без ответа сервера / ответ есть, ждём видимости
 		stageT0 = os.clock()
 		statReset("связи")
-		Log.w("ROUND связи %d: связей %d, запросов %d, интервал %.3f с", round, #todo, #tasks, gap)
-		local function close(rec, ok, err)
-			running[rec] = nil
-			inflight -= 1
-			local rtt = os.clock() - rec.t0
-			Stat.inflight, Stat.rttSum, Stat.rttN = inflight, Stat.rttSum + rtt, Stat.rttN + 1
-			local t, seen = rec.t, 0
-			if ok then
-				for _, r in ipairs(t.rs) do
-					local set = linkSet(r)
-					for _, src in ipairs(t.ss) do if set[src] then seen += 1 end end
+		Log.w("ROUND связи %d: связей %d, запросов %d, интервал %.0f мс", round, #todo, #tasks, gap * 1000)
+		local function check()                                  -- видно — готово; ждёт дольше BIND_WAIT — не прошло
+			local now = os.clock()
+			for i = #pending, 1, -1 do                            -- ответил (или пропал) — место для следующего запроса
+				local rec = pending[i]
+				if rec.ans or now - rec.t0 > 2 * BIND_WAIT then table.insert(waiting, table.remove(pending, i)) end
+			end
+			Stat.inflight = #pending
+			if now - lastCheck < 0.08 then return end
+			lastCheck = now
+			for i = #waiting, 1, -1 do
+				local rec = waiting[i]
+				local seen = seenOf(rec.t)
+				if seen >= rec.want or now - rec.t0 > BIND_WAIT or (rec.err and now - rec.t0 > 1) then
+					table.remove(waiting, i)
+					seenNow += seen; Stat.conf += seen
+					local t = rec.t
+					if seen >= rec.want then
+						okN += 1; streak += 1; dsum += now - rec.t0
+						if streak % 6 == 0 and cap < BIND_INFLIGHT then cap = math.min(BIND_INFLIGHT, cap + 2) end
+						if streak % 20 == 0 then gap = math.max(1 / 40, gap * 0.92) end   -- без потерь — чаще (46/с — уже 10 % потерь)
+						table.insert(recent, false)
+						if #recent > 40 then table.remove(recent, 1) end
+					else
+						badN += 1; Stat.fail += 1; streak = 0
+						-- редкие потери (19.10: 23 из 1489) дешевле дозапросить во втором круге, чем сбавлять ход
+						table.insert(recent, true)
+						if #recent > 40 then table.remove(recent, 1) end
+						local lost = 0
+						for _, x in ipairs(recent) do if x then lost += 1 end end
+						if lost >= 4 then                                  -- больше 10 % из последних 40 — реже
+							gap = math.min(0.1, gap * 1.3); recent = {}
+							Log.w("BIND: потерь %d из последних 40 — интервал %.0f мс (%.0f запросов/с)", lost, gap * 1000, 1 / gap)
+						end
+						if byAnswer and badN >= 6 and badN > okN then     -- потерь больше, чем удач: сервер отвечает раньше, чем делает
+							byAnswer = false
+							Log.w("BIND: потерь больше, чем удач, — следующий запрос только после видимых связей прошлого")
+						end
+					end
+					Log.w("SEND bind %s x%d -> %s x%d: видно %d из %d через %.2f с, ответ %s · разом %d%s", t.ss[1].Name, #t.ss,
+						t.rs[1].Name, #t.rs, seen, rec.want, now - rec.t0, rec.ans and ("%.2f с"):format(rec.ans) or "—", cap,
+						rec.err and (" · " .. rec.err) or "")
 				end
 			end
-			local want = #t.ss * #t.rs
-			seenNow, Stat.conf = seenNow + seen, Stat.conf + seen
-			if ok and seen == want then
-				okN += 1
-				if mode == 3 then gap = math.max(BIND_GAP_MIN, gap * 0.97) end
-			else
-				badN += 1
-				Stat.fail += 1
-				-- неудачи приходят пачкой (сервер подвис — несколько запросов попали к нему разом); пачка = одно замедление
-				if os.clock() - lastRaise > 0.3 then gap = math.min(BIND_GAP_MAX, gap * 1.3); lastRaise = os.clock() end
-			end
-			Log.w("SEND bind %s x%d -> %s x%d: ответ %.3f с, сразу видно %d из %d%s", t.ss[1].Name, #t.ss, t.rs[1].Name,
-				#t.rs, rtt, seen, want, ok and "" or (" · " .. tostring(err)))
-		end
-		local function reap()                                    -- списать запросы без ответа
-			local now = os.clock()
-			for rec in pairs(running) do
-				if now - rec.t0 > BIND_TIMEOUT then close(rec, false, ("нет ответа %d с"):format(BIND_TIMEOUT)) end
-			end
+			Stat.inflight, Stat.limit = #pending, cap
 		end
 		for i, t in ipairs(tasks) do
 			if not waitRun() then break end
-			while inflight >= BIND_INFLIGHT and not Engine.stopFlag do task.wait(); reap() end
-			local pause = nextAt - os.clock()
-			if pause > 0 then task.wait(pause) end
-			reap()
-			local inputs = {}
-			for _, r in ipairs(t.rs) do addInputs(inputs, r) end
-			local rec = { t = t, t0 = os.clock() }
-			-- task.wait просыпается только на кадре и опаздывает (v0.5: интервал 0.045 давал 0.058); опоздание
-			-- вычитается из следующей паузы, но не ближе 3/4 интервала
-			nextAt = math.max(nextAt + gap, rec.t0 + gap * 0.75)
-			running[rec] = true
-			inflight += 1
-			sent += 1
-			Stat.inflight, Stat.sent, Stat.limit = inflight, Stat.sent + 1, 1 / gap   -- «предел» здесь — запросов в секунду
-			task.spawn(function()
-				local keys, needKeys = {}, false
-				if t.k and t.k ~= -1 then
-					for action in pairs(inputs) do keys[action] = t.k end
-					needKeys = true
-				end
-				local ok, err = pcall(function() return tool.RF:InvokeServer(inputs, t.ss, keys, false, needKeys) end)
-				if running[rec] then close(rec, ok, err) end
-			end)
-			if i % 10 == 0 or i == #tasks then
+			-- не чаще интервала и не больше одного за кадр: сервер теряет запросы, пришедшие слишком часто (0.20.7: 6 за
+			-- кадр — потеряно 159 из 340)
+			while (#pending + (byAnswer and 0 or #waiting) >= cap or os.clock() - lastSend < gap) and not Engine.stopFlag do
+				task.wait(); check()
+			end
+			lastSend = os.clock()
+			table.insert(pending, send(t))
+			sent += 1; Stat.sent += 1
+			check()
+			if i % 5 == 0 or i == #tasks then
 				setBar(5, (total - before + seenNow) / total)
-				say(("Связи: запрос %s из %s · %.0f в секунду · не прошло %s"):format(fmt(i), fmt(#tasks),
-					i / math.max(0.001, os.clock() - stageT0), fmt(badN)))
+				say(("Связи: запрос %s из %s · %.1f в секунду · разом %d · не прошло %s"):format(fmt(i), fmt(#tasks),
+					i / math.max(0.001, os.clock() - stageT0), cap, fmt(badN)))
 			end
 		end
-		local t0 = os.clock()
-		while inflight > 0 and os.clock() - t0 < BIND_TIMEOUT + 1 do task.wait(); reap() end
-		Log.w("ROUND связи %d: запросов %d, прошло %d, не прошло %d, связей сразу видно %d, интервал стал %.3f с",
-			round, sent, okN, badN, seenNow, gap)
+		while (#pending > 0 or #waiting > 0) and not Engine.stopFlag do task.wait(0.1); check() end
+		Log.w("ROUND связи %d: запросов %d, прошло %d, не прошло %d, связей видно %d, видно в среднем через %.2f с, разом %d",
+			round, sent, okN, badN, seenNow, okN > 0 and dsum / okN or 0, cap)
 		settle(function() return countMissing(job) end, "связи", BIND_GRACE)
 		todo = missingLinks(job)
 		setBar(5, (total - #todo) / total)
 		if before - #todo == 0 then idle += 1 else idle = 0 end
 		if idle >= 2 then Log.w("ROUND связи: два круга без прогресса — хватит"); break end
-		if #todo > 0 then gap = math.min(BIND_GAP_MAX, math.max(gap, gap0) * 1.5) end   -- что-то не прошло — реже
 	end
 	for k = 1, math.min(#todo, 20) do                            -- что так и не соединилось (для разбора)
 		local nin = 0

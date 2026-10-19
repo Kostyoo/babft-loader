@@ -1,10 +1,31 @@
-﻿# Картинки для загрузчика BABFT: перетащи файлы на «перетащи_картинку_сюда.bat».
+﻿# Картинки для загрузчика BABFT: перетащи файлы на «kartinki_syuda.bat».
 # PNG, JPG, BMP копируются как есть; остальное (WEBP, GIF, TIFF, ICO, HEIC — что умеет Windows) переводится в PNG.
+# Имя — латиницей («кот.png» -> «kot.png»): у Xeno одно русское имя в workspace ломает список файлов (19.10).
 # Файл с таким именем уже есть — новому добавится (2), (3)…, чтобы загрузчик заметил его и открыл сам.
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Paths)
 $dst = Join-Path (Split-Path $PSScriptRoot -Parent) 'images'
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
 try { Add-Type -AssemblyName PresentationCore } catch {}
+$lat = @('a','b','v','g','d','e','e','zh','z','i','y','k','l','m','n','o','p','r','s','t','u','f','h','ts','ch','sh','sch','','y','','e','yu','ya')
+$abc = 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя'
+$map = New-Object 'System.Collections.Generic.Dictionary[string,string]'   # с учётом регистра (а не @{})
+for ($i = 0; $i -lt $abc.Length; $i++) {
+    $l = $lat[$i]
+    $map[[string]$abc[$i]] = $l
+    $map[([string]$abc[$i]).ToUpper()] = $(if ($l.Length -gt 0) { $l.Substring(0, 1).ToUpper() + $l.Substring(1) } else { '' })
+}
+function Ascii-Name([string]$s) {
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $s.ToCharArray()) {
+        $c = [string]$ch
+        if ($map.ContainsKey($c)) { [void]$sb.Append($map[$c]) }
+        elseif ([int]$ch -lt 128 -and $c -match '[A-Za-z0-9 ._()\-]') { [void]$sb.Append($c) }
+        else { [void]$sb.Append('_') }
+    }
+    $r = $sb.ToString().Trim()
+    if ($r -eq '' -or $r -match '^[_ .]+$') { $r = 'image_' + (Get-Date -Format 'MMdd_HHmmss') }
+    return $r
+}
 function Free-Name([string]$base, [string]$ext) {
     $p = Join-Path $dst ($base + $ext); $k = 2
     while (Test-Path -LiteralPath $p) { $p = Join-Path $dst ("{0} ({1}){2}" -f $base, $k, $ext); $k++ }
@@ -25,7 +46,7 @@ if (-not $Paths -or $Paths.Count -eq 0) {
 }
 foreach ($p in $Paths) {
     try {
-        $base = [IO.Path]::GetFileNameWithoutExtension($p)
+        $base = Ascii-Name ([IO.Path]::GetFileNameWithoutExtension($p))
         $k = Kind $p
         if ($k) {
             $out = Free-Name $base $k
